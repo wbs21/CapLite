@@ -1,0 +1,14 @@
+prefix=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min
+exec_prefix=${prefix}
+libdir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/lib
+includedir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/include
+
+Name: libswscale
+Description: FFmpeg image rescaling library
+Version: 10.1.102
+Requires: 
+Requires.private: libavutil >= 61.1.102
+Conflicts:
+Libs: -L${libdir}  -lswscale 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}

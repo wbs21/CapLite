@@ -1,0 +1,116 @@
+CapLite 1.0.0 - Third-Party Notices
+==================================
+
+This file lists the third-party components that are included in, or are used by,
+CapLite 1.0.0. It is shipped in two places, with identical content: in the root of
+the project repository, and inside the release package (the folder that also
+contains CapLite.exe).
+
+The application itself, CapLite, is licensed under the MIT License; the full text
+ships in the release package as "LICENSE" and in the repository root as "LICENSE".
+
+
+1. FFmpeg 9.0.2 -- LGPLv3-or-later
+----------------------------------
+
+Files in the release package:
+
+    avcodec-63.dll
+    avformat-63.dll
+    avutil-61.dll
+    swresample-7.dll
+    swscale-10.dll
+
+CapLite links against these DLLs **dynamically**. They are separate modules: you may
+replace any of them with your own compatible build of the same name and CapLite will
+load the replacement. CapLite does not check their signature or hash, as required by
+LGPLv3 section 4.
+
+The bundled DLLs were built by this project from the unmodified upstream FFmpeg
+9.0.2 sources with a minimal, LGPL-compliant configuration:
+
+    ./configure --disable-static --enable-shared --enable-version3 \
+                --disable-avdevice --disable-avfilter \
+                --disable-programs --disable-doc --disable-network \
+                ... (full parameter list: scripts/build-ffmpeg-min.ps1)
+
+    configure reports: "License: LGPL version 3 or later"
+
+No GPL-only or non-free component is enabled (no --enable-gpl, no --enable-nonfree),
+and no FFmpeg command-line program (ffmpeg.exe / ffprobe.exe) is shipped.
+
+Upstream sources (pristine tarball, as packaged by Debian):
+
+    http://mirrors.tuna.tsinghua.edu.cn/debian/pool/main/f/ffmpeg/ffmpeg_9.0.2.orig.tar.xz
+    SHA-256 8C3850283EB25FA026482078A04051E0BE17347B09EF81A0849BEC15A96E002E
+
+The reproducible build script is part of the project repository:
+
+    CapLite/scripts/build-ffmpeg-min.ps1
+
+The full license text is in the release package as "LICENSE-FFmpeg.txt".
+
+
+2. OpenH264 -- BSD-2-Clause (Cisco Systems)
+-------------------------------------------
+
+Files in the release package:
+
+    openh264.dll
+    openh264-7.dll
+
+(These two files are byte-identical copies of the same library under two names,
+because different builds of the library are looked up by either name at runtime.)
+
+OpenH264 is loaded at runtime with LoadLibraryW; CapLite only calls the encoder
+entry points exported by the DLL. The full license text is in the release package as
+"LICENSE-OpenH264.txt".
+
+Note: binaries distributed by Cisco Systems, Inc. may additionally be covered by the
+Cisco binary license terms. The OpenH264 DLL bundled here is the prebuilt binary that
+ships with the OpenH264 project (v2.6.0, x64, MSVC).
+
+
+3. libyuv -- BSD-3-Clause (Google Inc.)
+---------------------------------------
+
+libyuv is used for BGRA -> I420 colour conversion and is linked **statically** into
+CapLite.exe. Its license text (BSD-3-Clause) is reproduced in the project repository
+at CapLite/libyuv/libyuv/LICENSE.
+
+    Copyright 2011 The LibYuv Project Authors. All rights reserved.
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the conditions of the BSD-3-Clause license are met.
+
+
+4. Rust crates (crates.io)
+--------------------------
+
+CapLite.exe statically links a number of Rust crates. The large majority are dual
+licensed under MIT OR Apache-2.0; a small number use BSD-3-Clause, ISC, Zlib,
+Unicode-3.0 or similar permissive terms. Their license texts are available from
+crates.io and from the respective project repositories. The exact set and versions
+is pinned in the project's Cargo.lock.
+
+Notable direct dependencies: eframe/egui (MIT OR Apache-2.0), windows (MIT OR
+Apache-2.0), windows-capture (MIT), wasapi (MIT), crossbeam-channel (MIT OR
+Apache-2.0), serde/serde_json (MIT OR Apache-2.0), tracing/tracing-subscriber
+(MIT), directories (MIT OR Apache-2.0), rfd (MIT), ffmpeg-next (WTFPL/MIT).
+
+
+5. Fonts
+--------
+
+The user interface embeds a subset of a Chinese-capable open font. The subset is
+generated from the font already present on the build machine and is used only to
+render UI labels; no font file is redistributed as a standalone file.
+
+
+6. No GPL components
+--------------------
+
+This release contains **no GPL-licensed component**. The only LGPL component is the
+FFmpeg build described in section 1, which is used exclusively through dynamically
+loaded shared libraries that the user can replace. CapLite.exe itself is MIT licensed
+and statically links only permissively licensed code (MIT / Apache-2.0 / BSD /
+ISC / Zlib / Unicode-3.0).
