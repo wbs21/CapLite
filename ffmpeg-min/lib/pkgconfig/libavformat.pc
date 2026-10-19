@@ -1,0 +1,14 @@
+prefix=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min
+exec_prefix=${prefix}
+libdir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/lib
+includedir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 63.1.102
+Requires: 
+Requires.private: libavcodec >= 63.1.102, libavutil >= 61.1.102
+Conflicts:
+Libs: -L${libdir}  -lavformat 
+Libs.private: -lm -latomic
+Cflags: -I${includedir}

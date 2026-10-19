@@ -1,0 +1,87 @@
+[package]
+name = "caplite"
+version = "1.0.0"
+edition = "2021"
+description = "Windows 屏幕录制：全屏/区域 + OpenH264 视频 + AAC-LC 音频 + 流模式 MP4 + 关键帧剪辑"
+build = "build.rs"
+
+# 库名与包名同源：src/bin/*.rs 与 tests/*.rs 里的 `use caplite::…` 都指这里。
+[lib]
+name = "caplite"
+path = "src/lib.rs"
+
+# 主程序：显式声明，产物名 = CapLite.exe（Windows 上 Cargo 不会自动加 .exe 以外的东西）。
+# src/bin/ 下的其它工具（audio_probe / record_smoke / …）仍走自动发现，**不要**设 autobins = false。
+[[bin]]
+name = "CapLite"
+path = "src/main.rs"
+
+[dependencies]
+# --- UI ---
+eframe = "0.36.2"
+rfd = "0.17.2"
+
+# --- 配置/多语言/日志 ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tracing = "0.1.44"
+# P49：删掉 `tracing-appender` —— 全仓零引用（主程序写 `cap.log` 用的是
+# `ui::startup` 自己那套 sink，只有 `legacy/main.rs` 这个不参与构建的旧文件用过它）。
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+directories = "6.0.0"
+
+# --- 采集与录制编排 ---
+# 封装线程要同时消费"视频包/音频包"两路有界队列，需要 select 语义
+crossbeam-channel = "0.5"
+
+# --- 视频采集（DXGI Desktop Duplication；WGC 显示器路径在本机不可用，已实测）---
+windows-capture = "2.0.1"
+
+# --- 音频采集（WASAPI 环回 + 麦克风）---
+wasapi = "0.26.0"
+
+# --- Win32（GDI 鼠标指针合成、光标信息；LibraryLoader = 枚举完成后预加载 FFmpeg DLL；
+#     UI_Shell = 托盘图标 Shell_NotifyIconW；UI_Input_KeyboardAndMouse = 全局快捷键 RegisterHotKey）---
+# P51：删掉 `Win32_UI_HiDpi` —— 全仓没有任何 DPI API 调用（`GetDpiForWindow` 一个都没有，
+# 缩放与 DPI 感知都交给 eframe/winit），这个 feature 只会让 `windows` crate 多生成一批模块。
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    # 录制期间阻止系统休眠/关屏；WTS 会话通知（锁屏/远程断开）与磁盘剩余空间检查。
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_Storage_FileSystem",
+] }
+
+# --- FFmpeg（LGPLv3 动态链接）：AAC 编码 / 分片与普通 MP4 封装 / remux / copy 剪辑 / 解码缩略图 ---
+# feature 名以 crate 为准：codec=avcodec、format=avformat、software-resampling=swresample、
+# software-scaling=swscale（剪辑预览要把解码帧转 RGB）。不启用 filter/device，避免多带 30+ MB DLL。
+# 构建需 FFMPEG_DIR + LIBCLANG_PATH（见 _rust/env.ps1）
+ffmpeg-next = { version = "9.0.0", default-features = false, features = [
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling",
+] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+# 调试信息只保留"行号级"（1），不要默认的 2（完整 DWARF）：
+# 默认档下 111 个 .pdb 合计 2.15 GB（单个最大 194.9 MB），而 `target\` 的删除
+# 在这台机器上会进回收站 —— 体积越小，每轮构建丢进回收站的垃圾越少。
+# 行号级仍然有函数名与行号（backtrace / 断点照常可用），代价只是看不到局部变量。
+# 想要完整调试信息时，临时用：set CARGO_PROFILE_DEV_DEBUG=2
+debug = 1

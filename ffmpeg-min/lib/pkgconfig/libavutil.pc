@@ -1,0 +1,14 @@
+prefix=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min
+exec_prefix=${prefix}
+libdir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/lib
+includedir=C:UsersLIMITL~1DOCUME~1DEEPSE~1DEFAUL~1CapLiteffmpeg-min/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 61.1.102
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -luser32 -lbcrypt -latomic
+Cflags: -I${includedir}
