@@ -1,8 +1,8 @@
-CapLite 1.0.2 - Third-Party Notices
+CapLite 1.0.3 - Third-Party Notices
 ==================================
 
 This file lists the third-party components that are included in, or are used by,
-CapLite 1.0.2. It is shipped in two places, with identical content: in the root of
+CapLite 1.0.3. It is shipped in two places, with identical content: in the root of
 the project repository, and inside the release package (the folder that also
 contains CapLite.exe).
 
