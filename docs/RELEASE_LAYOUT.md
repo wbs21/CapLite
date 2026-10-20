@@ -6,7 +6,7 @@ packaging changes.
 ## Root
 
 ```text
-CapLite-1.0.2/
+CapLite-1.0.3/
 ├─ CapLite.exe
 ├─ README.md
 ├─ runtime/
@@ -71,8 +71,8 @@ licenses/
 pwsh -NoProfile -File scripts\check-release-layout.ps1
 ```
 
-6. Rebuild the ZIP from the `CapLite-1.0.2` folder; the ZIP root must be
-   `CapLite-1.0.2/`.
+6. Rebuild the ZIP from the `CapLite-1.0.3` folder; the ZIP root must be
+   `CapLite-1.0.3/`.
 
 The loader rule is the reason this layout is fixed: `AddDllDirectory(<exe>\runtime)`
 runs before delay-loaded FFmpeg and before the OpenH264 preload.
