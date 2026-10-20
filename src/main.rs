@@ -173,7 +173,6 @@ struct App {
     // P46：这里原来还有一个 `pending_editor_open`（"首帧之后才自动载入的上次视频"）。
     // 用户要求剪辑页**只认显式打开**，那条自动载入连同这个字段一起删了 ——
     // 于是"剪辑页上看到的永远是用户自己刚才指定的那一条"，启动时也不再走 FFmpeg。
-
     /// 上一次真正把配置写进磁盘的时刻（P45：滑条拖动时按 [`CFG_SAVE_MIN_GAP`] 节流）。
     cfg_saved_at: Option<Instant>,
     /// 有改动被节流推迟、还没落盘：等窗口过去（或松开鼠标 / 退出）时补一次。
@@ -203,9 +202,10 @@ impl App {
     /// 布局测量才可能和真机一致（见 `ui::layout`）。
     fn new(
         ctx: &egui::Context,
-        store: ConfigStore,
+        mut store: ConfigStore,
         log: StartupLog,
         explicit_config_dir_arg: bool,
+        initial_cfg: Option<Result<Config, caplite::error::AppError>>,
         // 是否安装托盘图标 + 注册全局快捷键。
         // 只有**真机**（`main()`）传 true：无窗口单测里建 message-only 窗口、
         // 往通知区域塞图标、抢全局热键都属于"副作用"，测试不该做。
@@ -225,7 +225,12 @@ impl App {
         // `cfg.dark_mode` 决定（P40），所以这里不能再"启动时无条件应用一次浅色"。
         // 首次应用前的空档里没有任何控件被画过（下面才开始建 `CentralPanel`），
         // 因此不存在"先按默认主题画一帧、再闪一下换肤"的问题。
-        startup_marks::mark_dur_log(log.log_fn(), "font_subset_installed", "app", app_t0.elapsed());
+        startup_marks::mark_dur_log(
+            log.log_fn(),
+            "font_subset_installed",
+            "app",
+            app_t0.elapsed(),
+        );
 
         // ① 配置目录：已经在 `main()` 里探测好（`store`：显式指定 → 用户\Documents\cap
         //    → exe 同级 → 临时目录，探测方式只创建目录并写一个探测文件）。
@@ -234,11 +239,14 @@ impl App {
         // ② 读配置：读不出来就回落默认值，并把原因留给提示条。
         //    若配置目录本身不可写，界面已经会显示"设置不会保留"，就不再叠加第二条错误。
         let cfg_t0 = Instant::now();
-        let (cfg, load_err) = match store.load() {
+        let loaded = initial_cfg.unwrap_or_else(|| store.load());
+        let (cfg, load_err) = match loaded {
             Ok(c) => (c, None),
             Err(e) => {
                 log.line(&format!("[cap] 配置加载失败，已回落默认值: {e}"));
                 if store.writable() {
+                    // 超时/暂时不可达不等于文件损坏：禁止本次运行用默认值覆盖原配置。
+                    store.mark_read_only();
                     (Config::default(), Some(e.to_string()))
                 } else {
                     (Config::default(), None)
@@ -273,13 +281,16 @@ impl App {
         let mut output_dir_dirty = false;
         let configured_ok = cfg.output_dir.trim().is_empty()
             || caplite::config::resolve_against_exe_dir(&cfg.output_dir)
-                .map(|d| caplite::config::probe_dir_writable(&d).is_ok())
+                .map(|d| caplite::config::probe_dir_writable_timeout(&d).is_ok())
                 .unwrap_or(false);
         let plan_deferred = !configured_ok;
         if plan_deferred {
             // 配置值不可用：这一种情况必须**立刻**走完整回退链 —— 不能让首帧显示
             // "输出目录不可写"，那对用户是恐慌，而不是事实（程序自己会换个能写的位置）。
-            let plan = plan_output_dir(&cfg.output_dir, &caplite::config::probe_dir_writable_timeout);
+            let plan = plan_output_dir(
+                &cfg.output_dir,
+                &caplite::config::probe_dir_writable_timeout,
+            );
             if let Some(chosen) = plan.chosen_path() {
                 let chosen_text = chosen.to_string_lossy().to_string();
                 if cfg.output_dir.trim() != chosen_text {
@@ -300,7 +311,11 @@ impl App {
             "output_dir_checked",
             "app",
             dir_t0.elapsed(),
-            if plan_deferred { "配置值不可用，已走完整回退链" } else { "配置值可用，回退链延后" },
+            if plan_deferred {
+                "配置值不可用，已走完整回退链"
+            } else {
+                "配置值可用，回退链延后"
+            },
         );
         // ④ 语言与外部语言包（`locales/` 以 exe 目录为基准，双击 exe 时不依赖 CWD）
         let i18n_t0 = Instant::now();
@@ -361,7 +376,10 @@ impl App {
             notices.push(Notice {
                 id: "config_dir_explicit_unwritable",
                 kind: caplite::ui::theme::Banner::Error,
-                text: i18n.tf("err_config_dir_explicit_fallback", &[&elide_middle(&to, 42)]),
+                text: i18n.tf(
+                    "err_config_dir_explicit_fallback",
+                    &[&elide_middle(&to, 42)],
+                ),
                 sticky: true,
             });
         }
@@ -382,12 +400,14 @@ impl App {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let cfg_dir = store.path().parent().map(|d| d.to_path_buf());
         let cache_t0 = Instant::now();
-        let cache_dir = caplite::cache::resolve_cache_dir(
-            exe_dir.as_deref(),
-            cfg_dir.as_deref(),
-            &|p| caplite::config::probe_dir_writable_timeout(p).is_ok(),
-        );
-        log.line(&format!("[cap] 临时文件目录(Cache): {}", cache_dir.display()));
+        let cache_dir =
+            caplite::cache::resolve_cache_dir(exe_dir.as_deref(), cfg_dir.as_deref(), &|p| {
+                caplite::config::probe_dir_writable_timeout(p).is_ok()
+            });
+        log.line(&format!(
+            "[cap] 临时文件目录(Cache): {}",
+            cache_dir.display()
+        ));
         startup_marks::mark_dur_log(log.log_fn(), "cache_dir_ready", "app", cache_t0.elapsed());
         // 派生缓存（波形峰值）可以安全修剪；`recordings` 子目录永远不在这里被碰。
         // 放后台线程：启动路径不该为几十个文件的 stat/delete 等待。
@@ -686,12 +706,19 @@ impl App {
 
     /// 收后台保存结果（每帧/隐藏时调用；绝不等待）。
     fn pump_cfg_saves(&mut self) {
+        let dead = self.cfg_saver.as_ref().is_some_and(|s| s.is_dead());
         let results = self
             .cfg_saver
             .as_mut()
             .map(|saver| saver.drain())
             .unwrap_or_default();
-        if results.is_empty() {
+        if dead {
+            // worker 已经 panic：不能让 in-flight 永远悬着；下一帧 fallback 到同步保存。
+            self.cfg_saver = None;
+            self.cfg_save_inflight = None;
+            self.push_cfg_save_error("后台配置保存线程异常退出");
+        }
+        if results.is_empty() && !dead {
             return;
         }
         for (id, result) in results {
@@ -1115,7 +1142,8 @@ impl App {
 
         // 录制中要持续刷新（时长、统计、状态）；后台 start/stop 期间也要排帧收结果。
         if self.recorder.is_some() || self.main.is_busy() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // ---- 关闭软件时的 Cache 提醒（用户最终版要求）----
@@ -1283,15 +1311,15 @@ impl App {
                     let selected = self.tab == tab;
                     let text = self.i18n.t(key);
                     let (fill, color) = if selected {
-                        (caplite::ui::theme::accent_soft(), caplite::ui::theme::accent())
+                        (
+                            caplite::ui::theme::accent_soft(),
+                            caplite::ui::theme::accent(),
+                        )
                     } else {
                         (egui::Color32::TRANSPARENT, caplite::ui::theme::muted())
                     };
                     let btn = egui::Button::new(
-                        egui::RichText::new(text)
-                            .size(14.0)
-                            .color(color)
-                            .strong(),
+                        egui::RichText::new(text).size(14.0).color(color).strong(),
                     )
                     .fill(fill)
                     .stroke(egui::Stroke::NONE)
@@ -1348,9 +1376,8 @@ impl App {
         self.sync_tray_recording();
         // 剪辑页的重后台任务（波形/深度检查/播放）只在“页面可见且没在录制”时跑：
         // 在首页开始录制后继续 4 线程整片解码，会直接和视频编码抢核。
-        self.editor.set_active(
-            self.tab == Tab::Editor && self.recorder.is_none() && !self.main.is_busy(),
-        );
+        self.editor
+            .set_active(self.tab == Tab::Editor && self.recorder.is_none() && !self.main.is_busy());
         // **离开剪辑页 = 停止播放**：切走之后 `editor.ui()` 不再被调用，
         // 播放时钟停了，但解码线程还在按实时速度往下解 —— 用户看不见却一直吃 CPU。
         if self.prev_tab == Tab::Editor && self.tab != Tab::Editor {
@@ -1380,7 +1407,8 @@ impl App {
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     // 左：状态
-                    let (state_text, state_color) = status_line(&self.i18n, &self.recorder, &self.last_result);
+                    let (state_text, state_color) =
+                        status_line(&self.i18n, &self.recorder, &self.last_result);
                     caplite::ui::theme::status_dot(ui, state_color);
                     ui.label(
                         egui::RichText::new(state_text)
@@ -1433,18 +1461,21 @@ impl App {
                                 .stroke(egui::Stroke::new(
                                     1.0,
                                     match kind {
-                                        caplite::ui::theme::Banner::Error => caplite::ui::theme::err_line(),
-                                        caplite::ui::theme::Banner::Warn => caplite::ui::theme::warn_line(),
-                                        caplite::ui::theme::Banner::Info => caplite::ui::theme::info_line(),
+                                        caplite::ui::theme::Banner::Error => {
+                                            caplite::ui::theme::err_line()
+                                        }
+                                        caplite::ui::theme::Banner::Warn => {
+                                            caplite::ui::theme::warn_line()
+                                        }
+                                        caplite::ui::theme::Banner::Info => {
+                                            caplite::ui::theme::info_line()
+                                        }
                                     },
                                 ))
                                 .corner_radius(egui::CornerRadius::same(4))
                                 .inner_margin(egui::Margin::symmetric(8, 2))
                                 .show(ui, |ui| {
-                                    if ui
-                                        .small_button(self.i18n.t("btn_got_it"))
-                                        .clicked()
-                                    {
+                                    if ui.small_button(self.i18n.t("btn_got_it")).clicked() {
                                         dismissed = true;
                                     }
                                     let width = (ui.available_width() - 4.0).max(80.0);
@@ -1452,7 +1483,8 @@ impl App {
                                         egui::vec2(width, 0.0),
                                         egui::Layout::top_down(egui::Align::LEFT),
                                         |ui| {
-                                            let rich = if kind == caplite::ui::theme::Banner::Error {
+                                            let rich = if kind == caplite::ui::theme::Banner::Error
+                                            {
                                                 egui::RichText::new(&text)
                                                     .size(caplite::ui::theme::FS_SMALL)
                                                     .color(fg)
@@ -1535,12 +1567,9 @@ impl App {
                             )
                         })
                         .unwrap_or(false);
-                    let outcome = self.settings.ui(
-                        ui,
-                        &mut self.cfg,
-                        &mut self.i18n,
-                        recording,
-                    );
+                    let outcome = self
+                        .settings
+                        .ui(ui, &mut self.cfg, &mut self.i18n, recording);
                     cfg_changed = outcome.cfg_changed;
                     // 保存失败的可见错误 → 底部栏红条（页面里不再画）
                     if let Some(e) = outcome.error {
@@ -1627,9 +1656,7 @@ impl App {
         // Warn 档（能继续，剪辑照常），文案由 i18n 给（中英各一份）。
         // 用 `Notice::id` 去重：同一条原因只显示一次，不会每帧刷屏。
         if let Some(w) = page_wave_error {
-            let text = self
-                .i18n
-                .tf("waveform_unavailable", &[&w]);
+            let text = self.i18n.tf("waveform_unavailable", &[&w]);
             self.push_notice(Notice {
                 id: "editor_waveform",
                 kind: caplite::ui::theme::Banner::Warn,
@@ -1738,10 +1765,9 @@ fn status_line(
             caplite::recorder::RecorderState::Finished => {
                 (i18n.t("rec_finished").to_string(), th::ok_fg())
             }
-            caplite::recorder::RecorderState::Failed(msg) => (
-                format!("{}：{msg}", i18n.t("state_failed")),
-                th::err_fg(),
-            ),
+            caplite::recorder::RecorderState::Failed(msg) => {
+                (format!("{}：{msg}", i18n.t("state_failed")), th::err_fg())
+            }
         },
         None => {
             if result.is_some() {
@@ -1785,10 +1811,7 @@ fn hotkey_error_text(i18n: &I18n, e: &caplite::tray::HotkeyRegisterError) -> Str
             None => i18n.tf("hotkey_taken", &[&label]),
         };
     }
-    i18n.tf(
-        "hotkey_register_failed",
-        &[&label, &e.code, &e.system],
-    )
+    i18n.tf("hotkey_register_failed", &[&label, &e.code, &e.system])
 }
 
 /// 注册失败的**日志行**（语言中立，进 `cap.log`；含 `GetLastError` 与候选建议）。
@@ -1836,7 +1859,7 @@ fn elide_middle(s: &str, max_chars: usize) -> String {
 ///
 /// 顺序与改动前完全一致：第一个能读到的就用它。
 const SYSTEM_CJK_CANDIDATES: &[(&str, u32)] = &[
-    ("C:\\Windows\\Fonts\\msyh.ttc", 0),   // 微软雅黑（ttc 的第 0 号字面）
+    ("C:\\Windows\\Fonts\\msyh.ttc", 0), // 微软雅黑（ttc 的第 0 号字面）
     ("C:\\Windows\\Fonts\\msyh.ttf", 0),
     ("C:\\Windows\\Fonts\\Deng.ttf", 0),   // 等线
     ("C:\\Windows\\Fonts\\simhei.ttf", 0), // 黑体
@@ -1894,7 +1917,9 @@ fn install_cjk_font(ctx: &egui::Context, log: &StartupLog) {
     // 退化路径：没有子集字体 → 与改动前一样，启动时直接装完整系统字体
     if let Some((name, data)) = read_system_cjk_data() {
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(name.to_owned(), std::sync::Arc::new(data));
+        fonts
+            .font_data
+            .insert(name.to_owned(), std::sync::Arc::new(data));
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
@@ -1925,7 +1950,9 @@ const FULL_FONT_NAME: &str = "cjk-full";
 /// 注意：`add_font` 会让 egui **在下一帧重建字体图集**（全量字形重新栅格化），
 /// 那时窗口已经在屏幕上了，用户看到的是"文字立刻变全"，而不是"窗口迟迟不出来"。
 fn install_full_cjk_font(ctx: &egui::Context) {
-    let Some((name, data)) = read_system_cjk_data() else { return };
+    let Some((name, data)) = read_system_cjk_data() else {
+        return;
+    };
     // `FontInsert` 不在 egui 顶层 re-export 里（只有 `FontData`/`FontDefinitions` 在），
     // 所以走 `egui::epaint::text` —— 那是 **egui 自己 re-export 的 epaint**，
     // 不会引入任何新依赖（`Cargo.toml` 不需要动）。
@@ -1960,7 +1987,9 @@ fn read_system_cjk() -> Option<String> {
 /// 读第一个能读到的系统中文字体，返回 `(字体名, 数据)`。
 fn read_system_cjk_data() -> Option<(&'static str, egui::FontData)> {
     for (path, index) in SYSTEM_CJK_CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         let mut data = egui::FontData::from_owned(bytes);
         data.index = *index;
         return Some((FULL_FONT_NAME, data));
@@ -2024,10 +2053,15 @@ struct StartupLog {
     path: Option<PathBuf>,
 }
 
-/// 后台配置保存器：UI 只把 `Config` 丢进 channel，真正的 `sync_all`/rename/杀毒软件
+type SaveSlot = std::sync::Arc<(std::sync::Mutex<Option<(u64, Config)>>, std::sync::Condvar)>;
+
+/// 后台配置保存器：UI 只把 `Config` 放进单槽，真正的 `sync_all`/rename/杀毒软件
 /// 重试都在 `cfg-save` 线程里，避免拖设置滑条时卡 UI。
 struct ConfigSaver {
-    tx: std::sync::mpsc::Sender<(u64, Config)>,
+    /// 单槽“最新值覆盖”：保存线程慢时，中间版本直接被下一次覆盖，不积压内存。
+    slot: SaveSlot,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     rx: std::sync::mpsc::Receiver<(u64, Result<(), String>)>,
     next_id: u64,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -2035,19 +2069,54 @@ struct ConfigSaver {
 
 impl ConfigSaver {
     fn new(store: ConfigStore) -> Self {
-        let (tx, req_rx) = std::sync::mpsc::channel::<(u64, Config)>();
+        let slot = std::sync::Arc::new((
+            std::sync::Mutex::new(None::<(u64, Config)>),
+            std::sync::Condvar::new(),
+        ));
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (res_tx, rx) = std::sync::mpsc::channel::<(u64, Result<(), String>)>();
+        let worker_slot = std::sync::Arc::clone(&slot);
+        let worker_closed = std::sync::Arc::clone(&closed);
+        let worker_dead = std::sync::Arc::clone(&dead);
         let handle = std::thread::Builder::new()
             .name("cfg-save".into())
             .spawn(move || {
-                while let Ok((id, cfg)) = req_rx.recv() {
-                    let r = store.save(&cfg).map_err(|e| e.to_string());
-                    let _ = res_tx.send((id, r));
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (lock, cv) = &*worker_slot;
+                    loop {
+                        let mut guard = match lock.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        while guard.is_none()
+                            && !worker_closed.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            guard = match cv.wait(guard) {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                        }
+                        if guard.is_none() {
+                            break;
+                        }
+                        let (id, cfg) = guard.take().expect("slot 刚确认非空");
+                        drop(guard);
+                        let r = store.save(&cfg).map_err(|e| e.to_string());
+                        let _ = res_tx.send((id, r));
+                    }
+                }));
+                if ran.is_err() {
+                    worker_dead.store(true, std::sync::atomic::Ordering::Release);
+                    worker_closed.store(true, std::sync::atomic::Ordering::Release);
+                    worker_slot.1.notify_all();
                 }
             })
             .ok();
         Self {
-            tx,
+            slot,
+            closed,
+            dead,
             rx,
             next_id: 0,
             handle,
@@ -2055,8 +2124,20 @@ impl ConfigSaver {
     }
 
     fn enqueue(&mut self, cfg: &Config) -> Option<u64> {
+        if self.dead.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        self.handle.as_ref()?;
         self.next_id = self.next_id.wrapping_add(1);
-        self.tx.send((self.next_id, cfg.clone())).ok()?;
+        {
+            let (lock, cv) = &*self.slot;
+            let mut slot = match lock.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            *slot = Some((self.next_id, cfg.clone()));
+            cv.notify_one();
+        }
         Some(self.next_id)
     }
 
@@ -2069,7 +2150,12 @@ impl ConfigSaver {
         out
     }
 
+    fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// 退出时等指定 id 的保存完成；超时返回 false，不阻塞进程退出。
+    #[cfg(test)]
     fn wait_for(&mut self, id: u64, timeout: std::time::Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2077,7 +2163,10 @@ impl ConfigSaver {
             if left.is_zero() {
                 return false;
             }
-            match self.rx.recv_timeout(left.min(std::time::Duration::from_millis(100))) {
+            match self
+                .rx
+                .recv_timeout(left.min(std::time::Duration::from_millis(100)))
+            {
                 Ok((got, _)) if got >= id => return true,
                 Ok(_) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2088,8 +2177,14 @@ impl ConfigSaver {
 
     fn shutdown(mut self, cfg: &Config, timeout: std::time::Duration) -> bool {
         let id = self.enqueue(cfg);
-        let ok = id.map(|id| self.wait_for(id, timeout)).unwrap_or(false);
-        drop(self.tx);
+        let result = id.and_then(|id| self.wait_for_result(id, timeout));
+        let ok = result.as_ref().is_some_and(|r| r.is_ok());
+        if let Some(Err(e)) = &result {
+            tracing::warn!(error = %e, "退出时最后一次配置保存失败");
+        }
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.slot.1.notify_all();
         // 保存线程通常已经处理完；join 只在它真的结束时返回，避免退出路径再无限等。
         if let Some(h) = self.handle.take() {
             if h.is_finished() {
@@ -2097,6 +2192,43 @@ impl ConfigSaver {
             }
         }
         ok
+    }
+
+    /// 等指定 id 的保存结果；超时/断开返回 `None`。
+    fn wait_for_result(
+        &mut self,
+        id: u64,
+        timeout: std::time::Duration,
+    ) -> Option<Result<(), String>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            match self
+                .rx
+                .recv_timeout(left.min(std::time::Duration::from_millis(100)))
+            {
+                Ok((got, result)) if got >= id => return Some(result),
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for ConfigSaver {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.slot.1.notify_all();
+        if let Some(h) = self.handle.take() {
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -2158,7 +2290,9 @@ impl StartupLog {
         if !LOG_TO_FILE {
             return;
         }
-        let Some(path) = self.path.as_deref() else { return };
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
         if std::fs::metadata(path)
             .map(|m| m.len() > LOG_MAX_BYTES)
             .unwrap_or(false)
@@ -2187,7 +2321,10 @@ fn rotate_log_file(path: &Path) -> bool {
     match std::fs::rename(path, &rotated) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("[cap] 日志轮转失败（继续写当前文件）: {}（{e}）", path.display());
+            eprintln!(
+                "[cap] 日志轮转失败（继续写当前文件）: {}（{e}）",
+                path.display()
+            );
             false
         }
     }
@@ -2196,7 +2333,10 @@ fn rotate_log_file(path: &Path) -> bool {
 /// 粗粒度脱敏：把绝对 Windows 路径（`C:\...`）与 UNC 路径（`\\server\...`）替换成
 /// `<path>`，避免 `cap.log` 长期记录用户名、文件名、共享路径。
 ///
-/// 只扫 ASCII 路径起点，UTF-8 文本按字符边界原样复制；路径在空白/引号/常见分隔符处结束。
+/// 只扫 ASCII 路径起点，UTF-8 文本按字符边界原样复制。路径里的空格是合法的
+/// （用户名/目录名本来就可能带空格），所以**不能**用 ASCII 空白判断结束；
+/// 这里只在换行、引号、括号、逗号、分号、竖线这些**明确分隔符**处截断。
+/// 宁可多吞掉路径后面的一点说明文字，也不把用户名/共享路径漏进日志。
 fn redact_log_text(input: &str) -> String {
     fn path_start(b: &[u8], i: usize) -> bool {
         (i + 2 < b.len()
@@ -2209,9 +2349,23 @@ fn redact_log_text(input: &str) -> String {
         let mut i = start;
         while i < b.len() {
             let c = b[i];
-            if c.is_ascii_whitespace()
-                || matches!(c, b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'|')
-            {
+            // tracing 的结构化字段形如 `src=C:\... error=...`：空格后若是
+            // `identifier=`，说明路径结束、下一个字段开始。普通路径里的空格后面
+            // 跟的是目录/文件名，不会长得像字段名。
+            if c == b' ' && i + 1 < b.len() {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'-')
+                {
+                    j += 1;
+                }
+                if j > i + 1 && j < b.len() && b[j] == b'=' {
+                    break;
+                }
+            }
+            if matches!(
+                c,
+                b'\r' | b'\n' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'|'
+            ) {
                 break;
             }
             i += 1;
@@ -2241,13 +2395,15 @@ fn write_log_line(file: &mut LogFile, line: &[u8]) -> std::io::Result<()> {
         // 先释放旧句柄，Windows 才允许 rename。
         file.file.take();
         if rotate_log_file(&file.path) {
-            file.file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file.path)
-                .ok();
+            if caplite::sys::is_safe_managed_file(&file.path) {
+                file.file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&file.path)
+                    .ok();
+            }
             file.size = 0;
-        } else if file.file.is_none() {
+        } else if file.file.is_none() && caplite::sys::is_safe_managed_file(&file.path) {
             file.file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -2275,7 +2431,18 @@ fn append_log_line(path: Option<&Path>, msg: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if !caplite::sys::is_safe_managed_file(path) {
+        eprintln!(
+            "[cap] 日志路径是符号链接/junction/硬链接，拒绝写入: {}",
+            path.display()
+        );
+        return;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(f) => LogFile {
             size: f.metadata().map(|m| m.len()).unwrap_or(0),
             file: Some(f),
@@ -2283,13 +2450,19 @@ fn append_log_line(path: Option<&Path>, msg: &str) {
         },
         // 日志写不进去（目录只读、磁盘满、被占用……）**不能影响启动**：只记一条 warning
         Err(e) => {
-            eprintln!("[cap] 日志写入失败（不影响启动）: {}（{e}）", path.display());
+            eprintln!(
+                "[cap] 日志写入失败（不影响启动）: {}（{e}）",
+                path.display()
+            );
             return;
         }
     };
     let line = format!("{}\n", redact_log_text(msg));
     if let Err(e) = write_log_line(&mut file, line.as_bytes()) {
-        eprintln!("[cap] 日志写入失败（不影响启动）: {}（{e}）", path.display());
+        eprintln!(
+            "[cap] 日志写入失败（不影响启动）: {}（{e}）",
+            path.display()
+        );
     }
 }
 
@@ -2310,6 +2483,13 @@ impl LogSink {
     fn new(path: &Path) -> Option<Self> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        if !caplite::sys::is_safe_managed_file(path) {
+            eprintln!(
+                "[cap] 日志路径是符号链接/junction/硬链接，拒绝写入: {}",
+                path.display()
+            );
+            return None;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -2473,8 +2653,67 @@ fn harden_dll_search() {
             .collect();
         let cookie = unsafe { AddDllDirectory(windows::core::PCWSTR(wide.as_ptr())) };
         if cookie.is_null() {
-            eprintln!("[cap] AddDllDirectory 失败：运行期 DLL 目录 {}", runtime.display());
+            eprintln!(
+                "[cap] AddDllDirectory 失败：运行期 DLL 目录 {}",
+                runtime.display()
+            );
         }
+    }
+}
+
+/// 应用配置文件里的 `config_dir` 第二级偏好。
+///
+/// 命令行/环境变量已经指定目录时（`explicit_arg == true`）不覆盖它；否则先读取
+/// 当前配置，再按 `config_dir` 重新探测一次。返回“最终 store + 是否发生重定向”。
+fn apply_configured_dir_preference(
+    mut store: ConfigStore,
+    explicit_arg: bool,
+) -> (
+    ConfigStore,
+    bool,
+    Option<Result<Config, caplite::error::AppError>>,
+) {
+    if explicit_arg || !store.writable() {
+        return (store, false, None);
+    }
+    let initial = match store.load() {
+        Ok(c) => c,
+        Err(e) => return (store, false, Some(Err(e))),
+    };
+    let Some(want) = initial.explicit_config_dir() else {
+        return (store, false, Some(Ok(initial)));
+    };
+    if store.path().parent() == Some(want.as_path()) {
+        return (store, false, Some(Ok(initial)));
+    }
+    let redirected = ConfigStore::detect(Some(want));
+    let changed = redirected.path() != store.path();
+    if changed {
+        store = redirected;
+    }
+    let loaded = if changed {
+        Some(store.load())
+    } else {
+        Some(Ok(initial))
+    };
+    (store, changed, loaded)
+}
+
+/// 启动早期（日志/窗口都还没就绪）的致命错误提示。
+fn show_startup_error(msg: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "CapLite".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 两个字符串都以 NUL 结尾，并在调用期间保持存活。
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 
@@ -2485,9 +2724,16 @@ fn main() -> eframe::Result<()> {
     startup_marks::mark("process_start", "process");
     // 单实例：必须在任何配置/日志/Cache 写入之前认领。已有实例时把它恢复到前台，
     // 然后退出第二个进程，避免两个进程抢 config.json.tmp / rec-*.mp4 / 全局热键。
-    if !caplite::single_instance::claim() {
-        let _ = caplite::single_instance::activate_existing();
-        return Ok(());
+    match caplite::single_instance::claim() {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = caplite::single_instance::activate_existing();
+            return Ok(());
+        }
+        Err(e) => {
+            show_startup_error(&e);
+            return Ok(());
+        }
     }
     harden_dll_search();
     let config_dir = config_dir_from_args();
@@ -2495,7 +2741,8 @@ fn main() -> eframe::Result<()> {
     let explicit_config_dir_arg = config_dir.is_some();
     // ① 配置目录探测：放在这里是为了让**启动日志的落点**共用同一个结果（App::new 直接收下）。
     // ② 启动日志：release 落盘（没有控制台），debug 只打控制台。
-    let store = ConfigStore::detect(config_dir);
+    let (store, config_redirected, initial_cfg) =
+        apply_configured_dir_preference(ConfigStore::detect(config_dir), explicit_config_dir_arg);
     let log = StartupLog::new(store.path().parent(), store.writable());
     // 先装 tracing sink，后面所有 tracing::warn!/error! 才会落到同一个 cap.log。
     init_tracing(log.file_path().as_deref());
@@ -2507,7 +2754,11 @@ fn main() -> eframe::Result<()> {
         "log_ready",
         "process",
         startup_marks::start().elapsed(),
-        format!("配置目录可用={}", store.writable()),
+        format!(
+            "配置目录可用={}，按配置文件重定向={}",
+            store.writable(),
+            config_redirected
+        ),
     );
     log.line(&format!(
         "[cap] ==== {} 启动 · {}{} ====",
@@ -2612,6 +2863,7 @@ fn main() -> eframe::Result<()> {
                 store,
                 log,
                 explicit_config_dir_arg,
+                initial_cfg,
                 // 真机：装托盘图标 + 注册全局快捷键（见 `App::new` 的说明）
                 true,
             )))
@@ -2633,10 +2885,31 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caplite::ui::layout::{
-        CHROME_H, EDITOR_REQ_H, MIN_INNER_H, MIN_INNER_W, RECORD_REQ_H,
-    };
+    use caplite::ui::layout::{CHROME_H, EDITOR_REQ_H, MIN_INNER_H, MIN_INNER_W, RECORD_REQ_H};
 
+    #[test]
+    fn config_dir_from_the_config_file_redirects_the_store() {
+        let root = std::env::temp_dir().join(format!("cap-config-redirect-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        let _ = std::fs::create_dir_all(&first);
+        let _ = std::fs::create_dir_all(&second);
+        let store = ConfigStore::detect(Some(first.clone()));
+        let cfg = Config {
+            config_dir: Some(second.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        store.save(&cfg).expect("initial config save");
+
+        let (redirected, changed, _) = apply_configured_dir_preference(store, false);
+        assert!(changed, "配置里的 config_dir 应触发重定向");
+        assert_eq!(redirected.path().parent(), Some(second.as_path()));
+
+        let store = ConfigStore::detect(Some(first.clone()));
+        let (_same, changed, _) = apply_configured_dir_preference(store, true);
+        assert!(!changed, "命令行显式目录必须优先于配置文件");
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn config_saver_writes_on_a_worker() {
         let dir = std::env::temp_dir().join(format!("cap-cfg-saver-{}", std::process::id()));
@@ -2655,12 +2928,24 @@ mod tests {
     #[test]
     fn log_redaction_hides_drive_and_unc_paths() {
         let s = redact_log_text(
-            "open C:\\Users\\Alice\\secret.mp4 and \\\\server\\share\\a b then ok",
+            "open C:\\Users\\Alice\\secret.mp4, and \\\\server\\share\\a b; then ok",
         );
         assert!(!s.contains("Alice"), "{s}");
         assert!(!s.contains("server"), "{s}");
         assert!(s.contains("<path>"), "{s}");
         assert!(s.contains("then ok"), "普通文字不应被吃掉：{s}");
+        // 用户名/目录名带空格是最容易漏的形态：必须整段替换，不能只截到第一个空格。
+        let spaced =
+            redact_log_text("[cap] 日志文件: C:\\Users\\Limit li\\Documents\\Codex\\cap.log");
+        assert!(!spaced.contains("Limit"), "{spaced}");
+        assert!(!spaced.contains("Documents"), "{spaced}");
+        assert!(spaced.ends_with("<path>"), "{spaced}");
+        let fields = redact_log_text("src=C:\\Users\\Limit li\\a.mp4 error=denied");
+        assert!(!fields.contains("Limit"), "{fields}");
+        assert!(
+            fields.contains("error=denied"),
+            "后续字段不应被吞掉：{fields}"
+        );
     }
 
     #[test]
@@ -2724,14 +3009,20 @@ mod tests {
 
             let notice = hotkey_warning_notice(&i18n, &err);
             assert_eq!(notice.kind, caplite::ui::theme::Banner::Warn);
-            assert!(notice.sticky, "热键没了是真降级，提示不该被保存成功顺手撤掉");
+            assert!(
+                notice.sticky,
+                "热键没了是真降级，提示不该被保存成功顺手撤掉"
+            );
             assert_eq!(notice.id, "hotkey_register_failed");
             assert_eq!(notice.text, text);
 
             // cap.log 那一行（语言中立）必须带错误码、组合名与建议
             let line = hotkey_log_line(&err);
             assert!(line.contains("1409"), "[{lang}] 日志缺错误码：{line}");
-            assert!(line.contains("Ctrl+Shift+R"), "[{lang}] 日志缺组合名：{line}");
+            assert!(
+                line.contains("Ctrl+Shift+R"),
+                "[{lang}] 日志缺组合名：{line}"
+            );
             assert!(line.contains("Ctrl+Alt+F9"), "[{lang}] 日志缺建议：{line}");
         }
 
@@ -2744,7 +3035,10 @@ mod tests {
         };
         let i18n = I18n::new("zh-CN");
         let text = hotkey_error_text(&i18n, &other);
-        assert!(text.contains("87") && text.contains("Ctrl+Shift+R"), "{text}");
+        assert!(
+            text.contains("87") && text.contains("Ctrl+Shift+R"),
+            "{text}"
+        );
         assert!(hotkey_log_line(&other).contains("87"));
     }
 
@@ -2760,12 +3054,30 @@ mod tests {
                 changed && !capturing
             }
         }
-        assert!(!should_apply(true, false, true), "进入捕获：不注册（正在注销）");
-        assert!(should_apply(false, true, false), "退出捕获（没改配置）：按原组合装回去");
-        assert!(should_apply(false, true, true), "退出捕获且改了配置：按新配置装");
-        assert!(should_apply(false, false, true), "不在捕获、配置改了：重新注册");
-        assert!(!should_apply(false, false, false), "什么都没变：一个 Win32 调用都不发");
-        assert!(!should_apply(true, true, true), "捕获中：任何配置变化都等退出捕获再注册");
+        assert!(
+            !should_apply(true, false, true),
+            "进入捕获：不注册（正在注销）"
+        );
+        assert!(
+            should_apply(false, true, false),
+            "退出捕获（没改配置）：按原组合装回去"
+        );
+        assert!(
+            should_apply(false, true, true),
+            "退出捕获且改了配置：按新配置装"
+        );
+        assert!(
+            should_apply(false, false, true),
+            "不在捕获、配置改了：重新注册"
+        );
+        assert!(
+            !should_apply(false, false, false),
+            "什么都没变：一个 Win32 调用都不发"
+        );
+        assert!(
+            !should_apply(true, true, true),
+            "捕获中：任何配置变化都等退出捕获再注册"
+        );
     }
 
     /// **设置页无窗口跑一遍**：新增的「常规」卡片（托盘开关 + 三选一 + 捕获控件）
@@ -2838,7 +3150,7 @@ mod tests {
         let log = StartupLog::new(store.path().parent(), store.writable());
         // 无窗口单测**不装托盘、不注册全局热键**：那是真机副作用（会往通知区域塞图标、
         // 占用一个系统级热键），测试进程不该做，也不需要（`enable_tray = false`）。
-        App::new(ctx, store, log, false, false)
+        App::new(ctx, store, log, false, None, false)
     }
 
     /// 无窗口跑一帧整个窗口（标签栏 + 页面 + 状态栏）。
@@ -3111,7 +3423,7 @@ mod tests {
         };
         let _ = store.save(&cfg);
         let log = StartupLog::new(store.path().parent(), store.writable());
-        let mut app = App::new(&ctx, store, log, false, false);
+        let mut app = App::new(&ctx, store, log, false, None, false);
 
         // 跑几帧：`flush_deferred_init` 在首帧之后执行，改造前正是在那里自动打开
         let mut time = 0.0;

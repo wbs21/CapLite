@@ -36,8 +36,8 @@ use crate::sys::{set_current_thread_priority, ThreadPriority};
 use crate::video::capture::{Capture, CaptureSpec, GrabOutcome};
 use crate::video::encode::{take_prewarmed_encoder, VideoEncoder};
 
-use crossbeam_channel::{bounded, select, Receiver, TrySendError};
 use crate::sync::lock_or_recover;
+use crossbeam_channel::{bounded, select, Receiver, TrySendError};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -156,12 +156,15 @@ pub(crate) enum PtsSource {
 /// 视频帧的 pts（毫秒，相对录制开始）。
 ///
 /// 纯函数，便于脱线程单测：两种口径在同一组输入下的差异就是"会不会快放"的根源。
-pub(crate) fn video_pts_ms(source: PtsSource, elapsed: Duration, frame_index: u64, target_fps: u32) -> i64 {
+pub(crate) fn video_pts_ms(
+    source: PtsSource,
+    elapsed: Duration,
+    frame_index: u64,
+    target_fps: u32,
+) -> i64 {
     match source {
         PtsSource::RealTime => elapsed.as_millis() as i64,
-        PtsSource::FrameIndex => {
-            (frame_index as i64) * 1000 / i64::from(target_fps.max(1))
-        }
+        PtsSource::FrameIndex => (frame_index as i64) * 1000 / i64::from(target_fps.max(1)),
     }
 }
 
@@ -198,7 +201,11 @@ pub(crate) fn video_pts_on_grid(elapsed_ms: i64, last_pts: Option<i64>, target_f
 ///
 /// 判定用的是**自增之后**的 deadline：`now > next + interval * RESYNC_AFTER_FRAMES`
 /// 等价于"落后来到了 5 拍及以上"，落后的 1~4 拍仍按原节拍追赶（不重同步）。
-pub(crate) fn advance_deadline(deadline: Instant, now: Instant, interval: Duration) -> (Instant, bool) {
+pub(crate) fn advance_deadline(
+    deadline: Instant,
+    now: Instant,
+    interval: Duration,
+) -> (Instant, bool) {
     let next = deadline.checked_add(interval).unwrap_or(deadline);
     let slack = interval
         .checked_mul(RESYNC_AFTER_FRAMES)
@@ -367,6 +374,8 @@ fn note_issue(issue: &Mutex<Option<String>>, msg: impl Into<String>) {
 struct StartGuard {
     stop: Arc<AtomicBool>,
     threads: Option<Vec<JoinHandle<()>>>,
+    /// 预先用 `create_new` 占住的流文件路径；启动失败时若仍是空文件就清掉。
+    reserved_output: Option<PathBuf>,
 }
 
 impl StartGuard {
@@ -374,6 +383,7 @@ impl StartGuard {
         Self {
             stop,
             threads: Some(Vec::new()),
+            reserved_output: None,
         }
     }
 
@@ -384,7 +394,19 @@ impl StartGuard {
     }
 
     fn take_threads(&mut self) -> Vec<JoinHandle<()>> {
+        // 成功路径：占位文件已交给写入线程，不能在这里删除。
+        self.reserved_output = None;
         self.threads.take().unwrap_or_default()
+    }
+
+    /// 以 `create_new` 预占输出路径，阻止复用旧文件或跟随预先放置的链接。
+    fn reserve_output(&mut self, path: &Path) -> std::io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        self.reserved_output = Some(path.to_path_buf());
+        Ok(())
     }
 }
 
@@ -398,6 +420,15 @@ impl Drop for StartGuard {
         self.stop.store(true, Ordering::SeqCst);
         for h in threads {
             let _ = h.join();
+        }
+        if let Some(path) = self.reserved_output.take() {
+            // 只有空占位才删；如果错误发生前已经写入了一点数据，保留给用户找回。
+            if std::fs::metadata(&path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -425,9 +456,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     let name = name.into();
-    thread::Builder::new()
-        .name(name.clone())
-        .spawn(move || {
+    thread::Builder::new().name(name.clone()).spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         if let Err(payload) = result {
             let msg = format!("{name} 线程 panic：{}", panic_text(payload.as_ref()));
@@ -444,6 +473,9 @@ pub struct Recorder {
     state: Arc<Mutex<RecorderState>>,
     stats: Arc<Mutex<RecorderStats>>,
     stop_flag: Arc<AtomicBool>,
+    /// 启动/收尾协作取消令牌。UI 看门狗超时后置位；各阶段在安全点检查，
+    /// 避免看门狗只放弃等待却把旧任务永久留在后台。
+    cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<RecordingResult>>>,
     /// 会话级问题（失败/panic/磁盘不足）。与 `state` 分开保存，避免收尾时被
     /// `Finalizing → Finished` 覆盖掉。
@@ -474,8 +506,21 @@ pub struct Recorder {
 impl Recorder {
     /// 启动录制。采集与编码器在返回前就建好，**参数错误会同步返回**。
     pub fn start(cfg: &Config, output: &Path) -> Result<Self, AppError> {
+        Self::start_cancellable(cfg, output, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 可取消的启动入口。取消是协作式的：阻塞中的 DXGI/OpenH264/WASAPI 调用
+    /// 不能被强行打断，但返回后会立刻释放，不再继续进入后续阶段或提交会话。
+    pub fn start_cancellable(
+        cfg: &Config,
+        output: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, AppError> {
         // 会话就绪耗时从**进入本函数**开始算：这是调用方（界面）感知到的"点开始后多久才有画面"
         let t_enter = Instant::now();
+        if cancel.load(Ordering::Acquire) {
+            return Err(AppError::Config("录制启动已取消".into()));
+        }
         // Cache 根与 recordings 子目录都必须是真实目录：如果其中任何一层是
         // junction/symlink，录制可能被重定向到管理员才有权写的位置。
         if let Some(rec_dir) = output.parent() {
@@ -493,7 +538,10 @@ impl Recorder {
             .unwrap_or_else(|_| std::env::temp_dir());
         if let Err(e) = std::fs::create_dir_all(&export_dir) {
             // 导出目录建不出来不算致命：录制照常，停止时会退到临时目录（并如实报错给界面）
-            tracing::warn!("创建导出目录失败（导出时会再试）：{} —— {e}", export_dir.display());
+            tracing::warn!(
+                "创建导出目录失败（导出时会再试）：{} —— {e}",
+                export_dir.display()
+            );
         }
         // 磁盘预检：低于安全余量直接拒绝开始，比录到一半把系统盘写满要好。
         // 取不到空间时失败开放（只记日志），不因为查询失败就阻止录制。
@@ -533,6 +581,13 @@ impl Recorder {
                 "请求的帧率超过录制上限，已夹紧（高刷新率屏幕按目标帧率抽帧）"
             );
         }
+        // 编码器/预热键必须与采集节拍使用同一个 fps；否则 API 调用方传入 120
+        // 时会出现“采集 60、编码器配置 120”的元数据与码控错位。
+        let encoder_cfg = {
+            let mut c = cfg.clone();
+            c.fps = fps;
+            c
+        };
 
         let want_video = cfg.content_mode.has_video();
         let want_audio = cfg.content_mode.has_audio();
@@ -563,12 +618,12 @@ impl Recorder {
             // `video::encode::prewarm_encoder_async`）：键一致就直接复用，省掉整个
             // `InitializeExt`；键不一致/没有/已过期就返回 None，走原来的同步创建。
             // 预热是纯优化：这条 `None` 分支就是"与预热前完全一样"的兜底路径。
-            let enc = match take_prewarmed_encoder(cfg, enc_w, enc_h) {
+            let enc = match take_prewarmed_encoder(&encoder_cfg, enc_w, enc_h) {
                 Some(prewarmed) => {
                     encoder_prewarmed = true;
                     prewarmed
                 }
-                None => VideoEncoder::new(cfg, enc_w, enc_h)?,
+                None => VideoEncoder::new(&encoder_cfg, enc_w, enc_h)?,
             };
             encoder_init_ms = t_enc.elapsed().as_millis() as u64;
             Some((cap, enc))
@@ -576,6 +631,9 @@ impl Recorder {
             None
         };
 
+        if cancel.load(Ordering::Acquire) {
+            return Err(AppError::Config("录制启动已取消".into()));
+        }
         // ---------- 音频侧 ----------
         let video_init_ms = t_video.elapsed().as_millis() as u64;
         let t_audio = Instant::now();
@@ -626,6 +684,9 @@ impl Recorder {
             extradata: a.extradata().to_vec(),
         });
 
+        if cancel.load(Ordering::Acquire) {
+            return Err(AppError::Config("录制启动已取消".into()));
+        }
         // ---------- 共享状态 ----------
         let state = Arc::new(Mutex::new(RecorderState::Recording));
         let stats = Arc::new(Mutex::new(RecorderStats::default()));
@@ -636,6 +697,12 @@ impl Recorder {
         // 否则 mux 线程可能一直等不到 AudioEnd/VideoEnd。
         let mut start_guard = StartGuard::new(Arc::clone(&stop_flag));
         let output = output.to_path_buf();
+        start_guard.reserve_output(&output).map_err(|e| {
+            AppError::Mp4(format!(
+                "创建录制流文件 {} 失败（拒绝覆盖已有文件）：{e}",
+                output.display()
+            ))
+        })?;
         let started = Instant::now();
         // "进入 start() → 第一帧编码完成"的时刻由视频线程写入（见 StartPhases::first_frame_ms）
         let first_frame_ms = Arc::new(AtomicU64::new(0));
@@ -660,29 +727,25 @@ impl Recorder {
             let output = output.clone();
             let export_dir = export_dir.clone();
             let audio_params = audio_params.clone();
-            spawn_guarded(
-                "cap-mux",
-                guard_issue,
-                guard_stop,
-                guard_state,
-                move || {
-                    mux_thread(
-                        output,
-                        export_dir,
-                        expect_video,
-                        expect_audio,
-                        audio_params,
-                        video_rx,
-                        audio_rx,
-                        stop,
-                        state,
-                        stats,
-                        result,
-                        issue,
-                        start_latency_ms,
-                    )
-                },
-            )
+            let cancel = Arc::clone(&cancel);
+            spawn_guarded("cap-mux", guard_issue, guard_stop, guard_state, move || {
+                mux_thread(
+                    output,
+                    export_dir,
+                    expect_video,
+                    expect_audio,
+                    audio_params,
+                    video_rx,
+                    audio_rx,
+                    stop,
+                    state,
+                    stats,
+                    result,
+                    issue,
+                    cancel,
+                    start_latency_ms,
+                )
+            })
             .map_err(|e| AppError::Mp4(format!("创建封装线程失败: {e}")))?
         };
         // 立刻纳入 guard：后续任一 spawn 失败，封装线程也会被置停/join。
@@ -778,9 +841,8 @@ impl Recorder {
                                     }
                                     Err(e) => {
                                         note_issue(&issue_thread, format!("构造 avcC 失败: {e}"));
-                                        *lock_or_recover(&state) = RecorderState::Failed(format!(
-                                            "构造 avcC 失败: {e}"
-                                        ));
+                                        *lock_or_recover(&state) =
+                                            RecorderState::Failed(format!("构造 avcC 失败: {e}"));
                                         stop.store(true, Ordering::Relaxed);
                                         break;
                                     }
@@ -834,8 +896,9 @@ impl Recorder {
                             }
                         }
                         let _ = tx.send(MuxMsg::VideoEnd);
-                    })
-                    .map_err(|e| AppError::Capture(format!("创建视频线程失败: {e}")))?,
+                    },
+                )
+                .map_err(|e| AppError::Capture(format!("创建视频线程失败: {e}")))?,
             );
         }
         drop(video_tx);
@@ -851,8 +914,9 @@ impl Recorder {
             let state = Arc::clone(&state);
             let n_sources = audio_sources.len();
             // 每路音源一个网关（小环 + Highest 搬运线程 + 大环）
-            let gateways: Vec<Arc<AudioGateway>> =
-                (0..n_sources).map(|_| Arc::new(AudioGateway::new())).collect();
+            let gateways: Vec<Arc<AudioGateway>> = (0..n_sources)
+                .map(|_| Arc::new(AudioGateway::new()))
+                .collect();
             for g in &gateways {
                 // P52：搬运线程起不来就报出来，别 panic（与上面"创建音频读取线程失败"同口径）。
                 g.start_transport()
@@ -1196,6 +1260,7 @@ impl Recorder {
             state,
             stats,
             stop_flag,
+            cancel,
             result,
             issue,
             // 成功路径：把已启动线程的所有权交给 Recorder；guard 的 Drop 变为空操作，
@@ -1240,6 +1305,11 @@ impl Recorder {
     /// 用户要了声音、但某一路音源没打开成功的原因（空 = 全部按预期打开）。
     pub fn audio_warnings(&self) -> &[String] {
         &self.audio_warnings
+    }
+
+    /// 收尾看门狗用的取消令牌。UI 在超时后置位，正在进行的 remux 会在下个包边界退出。
+    pub fn cancel_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
     }
 
     pub fn state(&self) -> RecorderState {
@@ -1316,6 +1386,7 @@ fn mux_thread(
     stats: Arc<Mutex<RecorderStats>>,
     result: Arc<Mutex<Option<RecordingResult>>>,
     issue: Arc<Mutex<Option<String>>>,
+    cancel: Arc<AtomicBool>,
     // `Recorder::start` 的会话就绪耗时（毫秒）：跟着结果回到界面/脚本，用来解释
     // "为什么录了 5 秒却只有 3 秒"（那部分时间花在会话初始化上，压根没画面）。
     start_latency_ms: u64,
@@ -1336,7 +1407,7 @@ fn mux_thread(
     // 纯音频模式：音频参数已知，立刻创建写入器
     if !expect_video {
         if let Some(ap) = &audio_params {
-            match FragmentedMp4Writer::create(&output, None, Some(ap)) {
+            match FragmentedMp4Writer::create_reserved(&output, None, Some(ap)) {
                 Ok(w) => writer = Some(w),
                 Err(e) => {
                     let msg = format!("创建仅音频 MP4 失败: {e}");
@@ -1352,7 +1423,11 @@ fn mux_thread(
             recv(video_rx) -> msg => match msg {
                 Ok(MuxMsg::InitVideo(vp)) => {
                     if writer.is_none() {
-                        match FragmentedMp4Writer::create(&output, Some(&vp), audio_params.as_ref()) {
+                        match FragmentedMp4Writer::create_reserved(
+                            &output,
+                            Some(&vp),
+                            audio_params.as_ref(),
+                        ) {
                             Ok(w) => {
                                 tracing::info!(
                                     "分片 MP4 已创建（avcC + 音频流 {}）",
@@ -1517,9 +1592,8 @@ fn mux_thread(
         }
     }
     if drain_errors > 0 {
-        let msg = format!(
-            "收尾时有 {drain_errors} 个包写盘失败，产物不完整（已按失败处理，流文件保留）"
-        );
+        let msg =
+            format!("收尾时有 {drain_errors} 个包写盘失败，产物不完整（已按失败处理，流文件保留）");
         note_issue(&issue, msg.clone());
         if failure.is_none() {
             failure = Some(msg);
@@ -1604,7 +1678,12 @@ fn mux_thread(
     }
     let faststart = match free {
         Some(free) => {
-            let need = src_bytes.saturating_add(disk::MIN_FREE_BYTES / 2);
+            // faststart 会先把整段写入目标，再创建同目录临时文件回拷 moov，
+            // 峰值接近“两份成片 + 固定余量”。之前只按一份 +256 MB 判断，
+            // 大文件在看似空间足够时仍会失败。
+            let need = src_bytes
+                .saturating_mul(2)
+                .saturating_add(disk::MIN_FREE_BYTES / 2);
             let ok = free >= need;
             if !ok {
                 tracing::warn!(
@@ -1620,7 +1699,12 @@ fn mux_thread(
     // **导出必须自校验**：`remux_to_plain_verified_opts` 除了 copy，还会把"产物时长/包数"
     // 与源流文件对账，不一致就返回 Err —— 于是"静默产出一个偏短的 MP4"这条路径被彻底堵死：
     // 要么导出完整，要么走下面的失败分支（保留 Cache 流文件 + 界面明确告警）。
-    let final_result = match mux::remux_to_plain_verified_opts(&output, &exported, faststart) {
+    let final_result = match mux::remux_to_plain_verified_opts_cancel_new(
+        &output,
+        &exported,
+        faststart,
+        Some(cancel.as_ref()),
+    ) {
         Ok(report) => {
             tracing::info!(
                 exported = %exported.display(),
@@ -1705,6 +1789,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_start_returns_before_creating_a_session() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let cfg = Config::default();
+        let out = std::env::temp_dir().join("cap-cancelled-start.mp4");
+        let err = Recorder::start_cancellable(&cfg, &out, cancel)
+            .err()
+            .expect("预取消的启动必须失败");
+        assert!(err.to_string().contains("取消"), "{err}");
+    }
+
+    #[test]
+    fn start_guard_reserves_output_and_refuses_existing_file() {
+        use std::sync::atomic::AtomicBool;
+        let dir = std::env::temp_dir().join(format!("cap-start-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.mp4");
+        {
+            let mut guard = StartGuard::new(Arc::new(AtomicBool::new(false)));
+            guard.reserve_output(&path).expect("首次应能占住");
+            assert!(path.is_file());
+        }
+        assert!(!path.exists(), "错误路径的空占位应被清掉");
+
+        std::fs::write(&path, b"old").unwrap();
+        let mut guard = StartGuard::new(Arc::new(AtomicBool::new(false)));
+        assert!(guard.reserve_output(&path).is_err(), "不得覆盖已有录制文件");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn guarded_thread_surfaces_panic_immediately() {
         let issue = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1719,7 +1834,10 @@ mod tests {
         .expect("spawn");
         assert!(h.join().is_ok(), "wrapper 自己不应把 panic 传出去");
         assert!(stop.load(Ordering::SeqCst), "panic 后必须置停止");
-        assert!(matches!(&*lock_or_recover(&state), RecorderState::Failed(_)));
+        assert!(matches!(
+            &*lock_or_recover(&state),
+            RecorderState::Failed(_)
+        ));
         assert!(lock_or_recover(&issue)
             .as_deref()
             .is_some_and(|s| s.contains("boom")));
@@ -1922,7 +2040,14 @@ mod tests {
     #[test]
     fn fps_is_hard_capped_at_sixty() {
         assert_eq!(MAX_RECORD_FPS, 60);
-        for (want, got) in [(120u32, 60u32), (90, 60), (61, 60), (60, 60), (30, 30), (1, 1)] {
+        for (want, got) in [
+            (120u32, 60u32),
+            (90, 60),
+            (61, 60),
+            (60, 60),
+            (30, 30),
+            (1, 1),
+        ] {
             assert_eq!(effective_fps(want), got, "{want} fps 应夹到 {got}");
         }
         // 0 由 `Recorder::start` 显式拒绝（这里只保证不会算出 0 间隔）
@@ -1968,7 +2093,11 @@ mod tests {
         let real = video_pts_ms(PtsSource::RealTime, wall, frames, fps);
         let by_index = video_pts_ms(PtsSource::FrameIndex, wall, frames, fps);
         assert_eq!(real, 4_000, "真实时刻口径：最后一帧 pts = 墙钟时刻");
-        assert_eq!(by_index, 160 * 1000 / 60, "帧序号口径：160 帧 @60fps 只有 2.67 s");
+        assert_eq!(
+            by_index,
+            160 * 1000 / 60,
+            "帧序号口径：160 帧 @60fps 只有 2.67 s"
+        );
         assert!(
             by_index < real - 1_000,
             "帧序号口径会让 4 秒的录制变成 {by_index} ms 的快放"
@@ -1988,9 +2117,18 @@ mod tests {
     /// pts 口径的边界：非法 fps 不 panic、不除以 0。
     #[test]
     fn video_pts_handles_degenerate_input() {
-        assert_eq!(video_pts_ms(PtsSource::FrameIndex, Duration::ZERO, 7, 0), 7_000);
-        assert_eq!(video_pts_ms(PtsSource::RealTime, Duration::from_millis(1_234), 7, 0), 1_234);
-        assert_eq!(video_pts_ms(PtsSource::FrameIndex, Duration::ZERO, 0, 60), 0);
+        assert_eq!(
+            video_pts_ms(PtsSource::FrameIndex, Duration::ZERO, 7, 0),
+            7_000
+        );
+        assert_eq!(
+            video_pts_ms(PtsSource::RealTime, Duration::from_millis(1_234), 7, 0),
+            1_234
+        );
+        assert_eq!(
+            video_pts_ms(PtsSource::FrameIndex, Duration::ZERO, 0, 60),
+            0
+        );
     }
 
     /// 视频滞后丢弃阈值：落后 ≥120ms 才丢；差一点不丢；正常路径（视频在前或紧跟）不误伤。
@@ -2023,7 +2161,10 @@ mod tests {
             !should_rebuild(ReadFault::DeviceLost, MAX_AUDIO_REBUILDS),
             "次数用尽后不再重建（放弃该路，补静音兜底）"
         );
-        assert!(!should_rebuild(ReadFault::DeviceLost, MAX_AUDIO_REBUILDS + 7));
+        assert!(!should_rebuild(
+            ReadFault::DeviceLost,
+            MAX_AUDIO_REBUILDS + 7
+        ));
         assert!(!should_rebuild(ReadFault::Fatal, 0));
         assert!(!should_rebuild(ReadFault::Fatal, MAX_AUDIO_REBUILDS - 1));
     }

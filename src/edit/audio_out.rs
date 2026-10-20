@@ -46,7 +46,7 @@ use ffmpeg_next::ffi as ff;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self};
@@ -91,6 +91,9 @@ pub(crate) struct PcmChunk {
     // P54：原先还有个 `pts_ms`（本批第一个样本的媒体时刻），标注"仅诊断/日志用"，
     // 但实际上从头到尾没人读 —— 每批都要算一次 `ts_to_ms` 再写进去，纯浪费。删掉。
     pub samples: Vec<f32>,
+    /// seek 世代。渲染线程只接受当前世代的 PCM，避免 seek 命令到达后
+    /// 又播放 producer 在旧位置已经排进通道的音频。
+    generation: u64,
 }
 
 /// 播放音频的**运行统计**（既是测试钩子，也是诊断出口：`output_live == false` 时
@@ -120,7 +123,7 @@ pub struct PlaybackStats {
 /// 两条后台线程共用的指令（同一个 `t` 发给两边：解码侧重定位、渲染侧重清队）。
 #[derive(Debug, Clone, Copy)]
 enum Cmd {
-    Seek(i64),
+    Seek { ms: i64, generation: u64 },
     Stop,
 }
 
@@ -138,6 +141,8 @@ pub struct AudioTrackHandle {
     stats: Arc<Mutex<PlaybackStats>>,
     /// 队列中尚未被渲染线程取走的样本帧数（节流水位判据）
     pending: Arc<AtomicUsize>,
+    /// 单调递增的 seek 世代（只在 UI 线程修改）
+    next_generation: AtomicU64,
 }
 
 impl AudioTrackHandle {
@@ -161,9 +166,15 @@ impl AudioTrackHandle {
         let dec = thread::Builder::new()
             .name("clip-audio-decode".into())
             .spawn(move || {
-                if let Err(e) =
-                    decode_produce(&p2, from_ms.max(0), connect_output, &cmd_d_rx, &pcm_tx, &pending_d, &stats_d)
-                {
+                if let Err(e) = decode_produce(
+                    &p2,
+                    from_ms.max(0),
+                    connect_output,
+                    &cmd_d_rx,
+                    &pcm_tx,
+                    &pending_d,
+                    &stats_d,
+                ) {
                     tracing::warn!(error = %e, "播放：音频解码结束，本端只有画面");
                 }
                 // ⚠️ **不在这里置 eof**：producer 退出只意味着"生产完了"，
@@ -177,7 +188,14 @@ impl AudioTrackHandle {
         let ren = thread::Builder::new()
             .name("clip-audio-render".into())
             .spawn(move || {
-                render_consume(pcm_rx, &cmd_r_rx, &eof_r, &stats_r, &pending_r, connect_output);
+                render_consume(
+                    pcm_rx,
+                    &cmd_r_rx,
+                    &eof_r,
+                    &stats_r,
+                    &pending_r,
+                    connect_output,
+                );
                 eof_r.store(true, Ordering::Relaxed);
             })
             .map_err(|e| AppError::Mp4(format!("启动音频渲染线程失败：{e}")))?;
@@ -192,13 +210,19 @@ impl AudioTrackHandle {
             eof,
             stats,
             pending,
+            next_generation: AtomicU64::new(0),
         })
     }
 
     /// 跳到 `t_ms`：**同一个 `t` 同时发给解码与渲染两条链**（与视频 seek 同一次调用点）。
     pub fn seek(&self, t_ms: i64) {
-        let _ = self.cmd_decode.send(Cmd::Seek(t_ms.max(0)));
-        let _ = self.cmd_render.send(Cmd::Seek(t_ms.max(0)));
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let cmd = Cmd::Seek {
+            ms: t_ms.max(0),
+            generation,
+        };
+        let _ = self.cmd_decode.send(cmd);
+        let _ = self.cmd_render.send(cmd);
     }
 
     /// 音频链是否已经结束（播完 / 没有音轨 / 链路失败）。
@@ -216,7 +240,6 @@ impl AudioTrackHandle {
         let frames = self.pending.load(Ordering::Relaxed) as u64;
         frames * 1000 / OUT_RATE as u64
     }
-
 
     /// 让链路收工（两条线程各发一次 Stop；都不 join）。
     pub fn stop(&mut self) {
@@ -466,6 +489,12 @@ fn decode_produce(
     pending: &AtomicUsize,
     stats: &Mutex<PlaybackStats>,
 ) -> Result<(), AppError> {
+    if !path.is_file() {
+        return Err(AppError::Mp4(format!(
+            "音频播放只支持本地文件：{}",
+            path.display()
+        )));
+    }
     let c_path = cpath(path)?;
     // SAFETY: 本节每个 FFmpeg 对象都由 RAII 守卫持有，提前返回也按逆序释放。
     unsafe {
@@ -483,6 +512,7 @@ fn decode_produce(
         if ff::avformat_find_stream_info(ictx.0, ptr::null_mut()) < 0 {
             return Err(AppError::Mp4("播放：读取流信息失败".into()));
         }
+        crate::mux::validate_input_streams(ictx.0)?;
 
         // 第一条音频流
         let mut aindex = -1i32;
@@ -548,7 +578,10 @@ fn decode_produce(
             ptr::null_mut(),
         );
         if ret < 0 || swr_raw.is_null() {
-            return Err(AppError::Audio(format!("播放：创建重采样器失败：{}", av_err(ret))));
+            return Err(AppError::Audio(format!(
+                "播放：创建重采样器失败：{}",
+                av_err(ret)
+            )));
         }
         let swr = Swr(swr_raw);
         if ff::swr_init(swr.0) < 0 {
@@ -568,6 +601,7 @@ fn decode_produce(
         let mut out_buf = vec![0.0f32; max_out * OUT_CHANNELS];
 
         let mut start_ms = from_ms.max(0);
+        let mut generation = 0u64;
         seek_audio(ictx.0, dec.0, swr.0, start_ms);
         // true = 大盘已经读完，正在冲解码器（不再读包，只收帧）
         let mut draining = false;
@@ -577,8 +611,12 @@ fn decode_produce(
             loop {
                 match cmd.try_recv() {
                     Ok(Cmd::Stop) => return Ok(()),
-                    Ok(Cmd::Seek(t)) => {
-                        start_ms = t.max(0);
+                    Ok(Cmd::Seek {
+                        ms,
+                        generation: new_generation,
+                    }) => {
+                        start_ms = ms.max(0);
+                        generation = new_generation;
                         seek_audio(ictx.0, dec.0, swr.0, start_ms);
                         draining = false;
                     }
@@ -661,7 +699,11 @@ fn decode_produce(
                 pending.fetch_add(n, Ordering::Relaxed);
                 // 交接（通道满则在这里睡——那正是节流的另一半）。
                 // send 失败 = 渲染线程已走（stop）：安静收工。
-                if pcm_tx.send(PcmChunk { samples })
+                if pcm_tx
+                    .send(PcmChunk {
+                        samples,
+                        generation,
+                    })
                     .is_err()
                 {
                     return Ok(());
@@ -684,6 +726,11 @@ fn decode_produce(
 // 渲染（消费）线程：唯一碰设备的线程——收数据、按设备节奏放水
 // ---------------------------------------------------------------------------
 
+/// seek 世代判据（纯函数，单测覆盖）。
+fn pcm_generation_matches(chunk_generation: u64, current_generation: u64) -> bool {
+    chunk_generation == current_generation
+}
+
 /// 消费线程主体。四件事按优先级：指令（seek/stop）→ 收数据 → 放水 → eof 收尾。
 ///
 /// **延迟打开设备**：等第一批数据到手（或 producer 结束）才开渲染设备——
@@ -703,6 +750,7 @@ fn render_consume(
     // 待写队列（交错 f32）。它只属于本线程。
     let mut queue: VecDeque<f32> = VecDeque::new();
     let mut disconnected = false;
+    let mut generation = 0u64;
     let lead_frames = LEAD_MS * OUT_RATE as i64 / 1000;
 
     while !disconnected || !queue.is_empty() {
@@ -710,10 +758,14 @@ fn render_consume(
         loop {
             match cmd.try_recv() {
                 Ok(Cmd::Stop) => return,
-                Ok(Cmd::Seek(_)) => {
+                Ok(Cmd::Seek {
+                    generation: new_generation,
+                    ..
+                }) => {
                     // ⚠️ 只清 queue，**不再扣 pending**：这些帧在 try_recv 收到时
                     // 就已经扣过了；再扣会把 usize 扣到下溢 panic。
                     queue.clear();
+                    generation = new_generation;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
@@ -726,7 +778,19 @@ fn render_consume(
                 Ok(chunk) => {
                     let n = chunk.samples.len() / OUT_CHANNELS;
                     pending.fetch_sub(n, Ordering::Relaxed);
-                    queue.extend(chunk.samples);
+                    // seek 之前 producer 已经排进通道的批必须丢弃：
+                    // 命令通道与 PCM 通道彼此独立，清掉本地 queue 并不能
+                    // 清掉 PCM 通道里已经存在的旧数据。
+                    //
+                    // 如果新世代的 PCM 比 Seek 命令先到，则让 chunk 反向推进
+                    // 本地世代并清空旧队列，避免丢掉 seek 后的第一帧音频。
+                    if chunk.generation > generation {
+                        generation = chunk.generation;
+                        queue.clear();
+                    }
+                    if pcm_generation_matches(chunk.generation, generation) {
+                        queue.extend(chunk.samples);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -778,7 +842,7 @@ fn render_consume(
     loop {
         match cmd.recv() {
             // producer 已退出，seek 无从重启播放：忽略（界面会重新 spawn）
-            Ok(Cmd::Seek(_)) => continue,
+            Ok(Cmd::Seek { .. }) => continue,
             Ok(Cmd::Stop) | Err(_) => return,
         }
     }
@@ -808,12 +872,32 @@ mod tests {
         let _ = std::fs::remove_file(&out);
         let o = Command::new(&ff)
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-                "-t", "2",
-                "-c:v", "libopenh264", "-b:v", "500k", "-g", "30", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "96k",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "2",
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "500k",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
                 "-shortest",
             ])
             .arg(&out)
@@ -839,10 +923,24 @@ mod tests {
         let _ = std::fs::remove_file(&out);
         let o = Command::new(&ff)
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
-                "-t", "2",
-                "-c:v", "libopenh264", "-b:v", "500k", "-g", "30", "-pix_fmt", "yuv420p",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=30",
+                "-t",
+                "2",
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "500k",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
             ])
             .arg(&out)
             .output()
@@ -865,8 +963,14 @@ mod tests {
     fn skip_before_start_keeps_priming_frames() {
         // 提前量 AAC_PRIMING_MS(=44ms) 内的帧**故意保留**（盖 AAC priming 静默）
         assert!(!skip_before_start(1_000, 1_000), "恰在起点：不丢");
-        assert!(!skip_before_start(1_000 - AAC_PRIMING_MS, 1_000), "提前量边界：不丢");
-        assert!(skip_before_start(900, 1_000), "比提前量还早：丢（seek 残余）");
+        assert!(
+            !skip_before_start(1_000 - AAC_PRIMING_MS, 1_000),
+            "提前量边界：不丢"
+        );
+        assert!(
+            skip_before_start(900, 1_000),
+            "比提前量还早：丢（seek 残余）"
+        );
         assert!(skip_before_start(0, 1_000), "远早于起点：丢");
         assert!(!skip_before_start(0, 0), "从片头播：什么都不丢");
     }
@@ -946,6 +1050,15 @@ mod tests {
         );
         assert!(s.peak > 0.05, "seek 之后的内容也应真的有声音");
         h.stop();
+    }
+
+    #[test]
+    fn stale_pcm_after_seek_is_rejected() {
+        assert!(pcm_generation_matches(7, 7), "当前世代必须接收");
+        assert!(
+            !pcm_generation_matches(6, 7),
+            "seek 前 producer 已排进通道的旧世代必须丢弃"
+        );
     }
 
     /// 没有音轨：**立即结束且不算错误**（如实降级的样板），设备都不碰。

@@ -1527,6 +1527,8 @@ impl RangeDecoder {
                     av_err(ret)
                 )));
             }
+            crate::mux::validate_input_streams(ictx.0)
+                .map_err(|e| AppError::Audio(e.to_string()))?;
 
             // 找第一条音频流
             let mut aidx = -1i32;

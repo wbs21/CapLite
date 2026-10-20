@@ -562,7 +562,10 @@ struct WaveJob {
 }
 
 /// 把已取消的波形线程交给后台 reaper join；UI 线程只负责移交句柄。
-fn reap_wave_handles(refine: Option<std::thread::JoinHandle<()>>, bases: Vec<std::thread::JoinHandle<()>>) {
+fn reap_wave_handles(
+    refine: Option<std::thread::JoinHandle<()>>,
+    bases: Vec<std::thread::JoinHandle<()>>,
+) {
     if refine.is_none() && bases.is_empty() {
         return;
     }
@@ -715,10 +718,7 @@ impl WaveState {
     /// 多一个只在测试里活的访问器比在生产代码里留一个死方法干净。
     #[cfg(test)]
     fn base_handles_count(&self) -> usize {
-        self.job
-            .as_ref()
-            .map(|j| j.base_handles.len())
-            .unwrap_or(0)
+        self.job.as_ref().map(|j| j.base_handles.len()).unwrap_or(0)
     }
 
     /// 本帧的可用性。
@@ -941,11 +941,8 @@ impl WaveState {
         //   ① 单次解码量有上界（一段 / 一片），没有"整片解码"这种不可打断的长任务；
         //   ② UI 线程从不同步等待它（只 `try_lock` / `try_recv`，`snapshot()` 只克隆 `Arc`）；
         //   ③ 渲染只遍历可见区间，且长视口下把切片**合并到像素**（见 `segments_for_view`）。
-        let workers = if have_base {
-            0
-        } else {
-            waveform::WAVE_WORKERS
-        };
+        let wave_panic_error = i18n.t("err_wave_decode_failed").to_string();
+        let workers = if have_base { 0 } else { waveform::WAVE_WORKERS };
         let mut base_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(workers);
         if workers == 0 {
             // 没什么可算的：`tx` 随之被丢弃 → `rx` 断开，
@@ -973,12 +970,24 @@ impl WaveState {
                 let shared_w = shared.clone();
                 let ctx_w = ui_ctx.clone();
                 let tx_w = tx.clone();
+                let panic_error_w = wave_panic_error.clone();
                 match std::thread::Builder::new()
                     .name(format!("clip-wave-base-{i}"))
                     .spawn(move || {
-                        waveform::base_worker_loop(&path, &plan_w, &cancel_w, wake_w.as_ref());
+                        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || waveform::base_worker_loop(
+                                &path,
+                                &plan_w,
+                                &cancel_w,
+                                wake_w.as_ref(),
+                            ),
+                        ));
+                        if ran.is_err() {
+                            plan_w.set_error(panic_error_w);
+                            plan_w.fail_all_pending();
+                        }
                         // 收尾：所有段都尝试过了就标记"渐进结束"，并把最后一份快照换上
-                        if plan_w.all_attempted() {
+                        if plan_w.all_attempted() || ran.is_err() {
                             plan_w.finish();
                         }
                         if let Ok(mut g) = shared_w.lock() {
@@ -1015,9 +1024,11 @@ impl WaveState {
         let cancel_tile = cancel.clone();
         let shared_tile = shared.clone();
         let ctx_tile = ui_ctx.clone();
+        let panic_error_tile = wave_panic_error.clone();
         let spawned_tile = std::thread::Builder::new()
             .name("clip-wave-refine".into())
             .spawn(move || {
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // **一个解码器实例服务全部细化请求**（见 `waveform::RangeDecoder`）：
                 // 打开 + 探测文件的固定开销只付一次，否则每片 5 秒音频的代价会被它翻倍。
                 let mut dec = match waveform::RangeDecoder::new(&src2) {
@@ -1068,6 +1079,15 @@ impl WaveState {
                             }
                         }
                     }
+                }
+                }));
+                if ran.is_err() {
+                    if let Ok(mut g) = shared_tile.lock() {
+                        if g.error.is_none() {
+                            g.error = Some(panic_error_tile.clone());
+                        }
+                    }
+                    wake_ui(&ctx_tile);
                 }
             });
 
@@ -1181,7 +1201,14 @@ impl WaveState {
             if self.cached_tile(tile, tier) || self.requested.contains(&(tile, tier)) {
                 continue;
             }
-            if job.req_tx.send(RefineReq::Tile { tile, bucket_ms: tier }).is_ok() {
+            if job
+                .req_tx
+                .send(RefineReq::Tile {
+                    tile,
+                    bucket_ms: tier,
+                })
+                .is_ok()
+            {
                 self.requested.insert((tile, tier));
                 sent += 1;
             }
@@ -1213,7 +1240,11 @@ impl WaveState {
     /// 只比片号会把"旧档的数据"误判成"这一档已经有了" —— 那就永远不重算了。
     fn cached_tile(&self, tile: usize, bucket_ms: i64) -> bool {
         match self.shared.as_ref().and_then(|s| s.try_lock().ok()) {
-            Some(g) => g.tiles.peek(tile).map(|t| t.bucket_ms == bucket_ms).unwrap_or(false),
+            Some(g) => g
+                .tiles
+                .peek(tile)
+                .map(|t| t.bucket_ms == bucket_ms)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -1232,11 +1263,11 @@ impl WaveState {
         while job.rx.try_recv().is_ok() {
             out.got_message = true;
         }
-        let (finished, err, codec, cache_hit) = match self.shared.as_ref().and_then(|p| p.try_lock().ok())
-        {
-            Some(g) => (g.finished, g.error.clone(), g.codec.clone(), g.cache_hit),
-            None => (false, None, String::new(), false),
-        };
+        let (finished, err, codec, cache_hit) =
+            match self.shared.as_ref().and_then(|p| p.try_lock().ok()) {
+                Some(g) => (g.finished, g.error.clone(), g.codec.clone(), g.cache_hit),
+                None => (false, None, String::new(), false),
+            };
         // 本帧能读到的最新快照先留下（换文件时 `cancel_current` 会清掉它）
         if let Some(s) = self.snapshot() {
             self.last_good = Some(s);
@@ -1331,7 +1362,6 @@ struct WavePolled {
     /// 基准层是否来自落盘缓存（只用于日志）
     cache_hit: bool,
 }
-
 
 /// 一张已上传为纹理的缩略图（**P21 起只服务胶片条**：键 = 量化后的取样时刻）。
 struct Thumb {
@@ -1660,7 +1690,11 @@ pub struct EditorPage {
 
     /// 导出
     exporting: bool,
-    export_rx: Option<Receiver<Result<ExportReport, crate::error::AppError>>>,
+    export_rx: Option<Receiver<(u64, Result<ExportReport, crate::error::AppError>)>>,
+    /// 导出世代：打开新素材时递增，旧导出即使晚到也不能更新新素材的界面。
+    export_epoch: u64,
+    /// 编辑页导出的协作取消令牌（切换素材时置位，旧线程在包边界退出）。
+    export_cancel: Option<Arc<AtomicBool>>,
     report: Option<ExportReport>,
 
     /// **播放**（`Some` = 正在播放）。见 [`PlayState`]。
@@ -1670,6 +1704,8 @@ pub struct EditorPage {
     /// 生产里恒为 `true`；无窗口单测把它置 `false` —— 于是"时钟推进 / 翻页 / 停止"
     /// 这些**纯逻辑**可以完全确定地断言，而不必去碰一个不存在的素材文件。
     play_decode_enabled: bool,
+    /// 仅测试用：音频链是否真的连接输出设备。
+    play_audio_output: bool,
     /// 上一帧预览画框的宽度（逻辑点）。
     ///
     /// 播放的解码尺寸由它决定（`thumb_bucket_w` 量化）：按"画框多大就解多大"，
@@ -1773,6 +1809,8 @@ pub struct EditorPage {
     /// **打开的第几轮**（每次 `open()` +1）：后台消息带上它，只有对得上号才应用 ——
     /// 否则"快速连开两个文件"时，第一个文件的迟到消息会把第二个文件的界面盖掉。
     open_epoch: u64,
+    /// 当前打开/关键帧扫描任务的协作取消令牌（换文件时置位）。
+    open_cancel: Option<Arc<AtomicBool>>,
     /// **关键帧扫描是否还在跑**（P34）：`true` 期间 `keyframes_ms` 可能不完整，
     /// **导出必须禁用** —— 不完整的表会让 copy 导出落在非关键帧上（画面起不来）。
     /// 扫描结果到达（或打开失败）时置 `false`。
@@ -1869,9 +1907,12 @@ impl EditorPage {
             thumb_failed: std::collections::HashSet::new(),
             exporting: false,
             export_rx: None,
+            export_epoch: 0,
+            export_cancel: None,
             report: None,
             play: None,
             play_decode_enabled: true,
+            play_audio_output: true,
             preview_frame_w: 0.0,
             error: None,
             notice: None,
@@ -1906,6 +1947,7 @@ impl EditorPage {
             open_rx: None,
             open_pending_name: None,
             open_epoch: 0,
+            open_cancel: None,
             keyframes_scanning: false,
             open_started_at: None,
             deep_rx: None,
@@ -1941,6 +1983,19 @@ impl EditorPage {
         self.error = None;
         self.notice = None;
         self.report = None;
+        // 换文件会让在途导出的结果失去归属：置取消、断开通道并递增 epoch。
+        // 旧线程在包边界退出并删除 `.part`，不会再继续整文件拷贝。
+        if let Some(cancel) = self.export_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        // 旧文件的关键帧扫描同样在包边界检查取消：快速连开大文件时，
+        // 旧扫描线程不该继续读完整个旧文件、和第一次播放/波形抢磁盘。
+        if let Some(cancel) = self.open_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.export_epoch = self.export_epoch.wrapping_add(1);
+        self.export_rx = None;
+        self.exporting = false;
         // **换片子必须停播放**：否则解码线程还在读上一个文件，界面却已经换成新的
         // （画面会"播着新片子、内容还是旧的"）。放在最前面：后面的清理可能提前 return。
         self.stop_play();
@@ -1996,15 +2051,25 @@ impl EditorPage {
         let epoch = self.open_epoch;
         let (tx, rx) = std::sync::mpsc::channel::<OpenMsg>();
         let p = path.to_path_buf();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        self.open_cancel = Some(cancel);
         let spawned = std::thread::Builder::new()
             .name("clip-open".into())
             .spawn(move || {
-                match edit::open_streaming(&p, |clip| {
-                    // 探测即交：界面据此起首帧/胶片条/波形，**不等关键帧扫描**
-                    let _ = tx.send(OpenMsg::Clip(clip.clone(), epoch));
-                }) {
-                    Ok((_clip, pass)) => {
+                match edit::open_streaming_cancel(
+                    &p,
+                    |clip| {
+                        // 探测即交：界面据此起首帧/胶片条/波形，**不等关键帧扫描**
+                        let _ = tx.send(OpenMsg::Clip(clip.clone(), epoch));
+                    },
+                    Some(&cancel_thread),
+                ) {
+                    Ok(Some((_clip, pass))) => {
                         let _ = tx.send(OpenMsg::Scan(pass, epoch));
+                    }
+                    Ok(None) => {
+                        // 已被新一轮打开取消：不发送任何"完成"消息。
                     }
                     Err(e) => {
                         let _ = tx.send(OpenMsg::Failed(e.to_string(), epoch));
@@ -2018,6 +2083,7 @@ impl EditorPage {
                 // 至少"文件能打开、界面有解释"，绝不静默卡在"正在打开"。
                 tracing::warn!(error = %e, "clip-open 线程起不来，退化为同步打开");
                 self.open_rx = None;
+                self.open_cancel = None;
                 self.open_pending_name = None;
                 match edit::open(path) {
                     Ok(clip) => {
@@ -2117,6 +2183,7 @@ impl EditorPage {
                     return;
                 }
                 self.open_rx = None; // 终态：这一轮打开结束
+                self.open_cancel = None;
                 self.keyframes_scanning = false;
                 let (kfs, health) = (pass.keyframes_ms, pass.health);
                 // 体检结论落 `clip.health`（**唯一真相源**：播放跳过 / 绘制 / 导出剔除都读它）
@@ -2157,7 +2224,11 @@ impl EditorPage {
                     return;
                 }
                 self.open_rx = None;
-                let dur = self.open_started_at.map(|t| t.elapsed()).unwrap_or_default();
+                self.open_cancel = None;
+                let dur = self
+                    .open_started_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
                 crate::ui::startup::mark_with(
                     "editor_open_failed",
                     "wave",
@@ -2172,6 +2243,7 @@ impl EditorPage {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // 后台线程意外没了：按失败收尾，绝不永远停在"正在打开"
                 self.open_rx = None;
+                self.open_cancel = None;
                 let msg = self.i18n.t("err_open_worker_gone").to_string();
                 self.fail_open(&msg);
             }
@@ -2815,7 +2887,9 @@ impl EditorPage {
     /// **落点是 `cap.log`**（走 [`p27_log`] → `ui::startup::mark_with`）：
     /// 产品没有 tracing 订阅者，只写 `tracing::info!` 的话用户机器上什么都看不见。
     fn log_p27_sample_span(&self) {
-        let Some(clip) = self.clip.as_ref() else { return };
+        let Some(clip) = self.clip.as_ref() else {
+            return;
+        };
         let (end_ms, from_video) = p27_sample_span_end_ms(clip);
         // 文件名取 `clip.src`（不取 `import_log_name`）：本函数在 `open()` 里**早于**
         // `begin_import_phase`（那里才填 `import_log_name`），用后者会记出一个空名字。
@@ -2906,7 +2980,8 @@ impl EditorPage {
             let key = strip_thumb_key(t, span_end, STRIP_TILE_W as u32, tile_h);
             let img = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[0x60u8; 16]);
             let tex = ctx.load_texture(format!("strip{t}"), img, egui::TextureOptions::NEAREST);
-            self.strip_thumbs.insert(key, CachedThumb { w: 2, h: 2, tex });
+            self.strip_thumbs
+                .insert(key, CachedThumb { w: 2, h: 2, tex });
         }
     }
 
@@ -2973,7 +3048,9 @@ impl EditorPage {
         if self.thumb_pending.is_some() {
             return; // 已经有在途任务：等它回来（"单张在途"）
         }
-        let Some(clip) = self.clip.as_ref() else { return };
+        let Some(clip) = self.clip.as_ref() else {
+            return;
+        };
         let path = clip.src.clone();
         // **P27 ①**：键与"片尾留白"一律按**视频流时长**算（不是容器时长）
         let span_end = p27_sample_span_end_ms(clip).0;
@@ -3021,7 +3098,9 @@ impl EditorPage {
             return;
         };
         self.ensure_thumb_worker(ctx);
-        let Some(tx) = self.thumb_job_tx.as_ref() else { return };
+        let Some(tx) = self.thumb_job_tx.as_ref() else {
+            return;
+        };
         let (max_w, max_h) = decode_size(STRIP_TILE_W as u32, self.source_aspect());
         let job = ThumbJob {
             path,
@@ -3071,14 +3150,10 @@ impl EditorPage {
                     // **P27 ①：失败时按方向搜索**（`job.alts` 已经是有界、有序、
                     // 不跨相邻取样点的探查时刻）。命中第一个能解的即停；
                     // 全都解不出来时**如实带回第一次的错误**（界面据此走兜底链）。
-                    let (frame, decoded_ms) = match p27_search_decode(
-                        job.at_ms,
-                        &job.alts,
-                        |t| {
-                            edit::thumbnail(&job.path, t, job.max_w, job.max_h)
-                                .map_err(|e| e.to_string())
-                        },
-                    ) {
+                    let (frame, decoded_ms) = match p27_search_decode(job.at_ms, &job.alts, |t| {
+                        edit::thumbnail(&job.path, t, job.max_w, job.max_h)
+                            .map_err(|e| e.to_string())
+                    }) {
                         Ok((v, t, _attempts)) => (Ok(v), t),
                         Err((e, _attempts)) => (Err(e), job.at_ms),
                     };
@@ -3181,10 +3256,7 @@ impl EditorPage {
             Ok(res) => {
                 self.thumb_pending = None;
                 // 结果可能属于上一个 clip（用户中途换了视频）→ 直接丢掉，不许污染缓存
-                let same_clip = self
-                    .clip
-                    .as_ref()
-                    .is_some_and(|c| c.src == res.path);
+                let same_clip = self.clip.as_ref().is_some_and(|c| c.src == res.path);
                 if same_clip {
                     match res.frame {
                         Ok((w, h, rgba)) => {
@@ -3218,16 +3290,14 @@ impl EditorPage {
                                 ),
                                 None => format!("kf-thumb-{}-{}", res.at_ms, res.bucket_w),
                             };
-                            let tex =
-                                ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
+                            let tex = ctx.load_texture(name, img, egui::TextureOptions::LINEAR);
                             // **P24：按任务自带的归属回填**（胶片条 → `strip_thumbs`，键带高度；
                             // 预览 → `kf_thumbs`）。绝不靠猜 —— 猜错就是把一个高度档的画面
                             // 写进另一个高度档的键。
                             match res.strip_key {
-                                Some(key) => self.remember_strip_thumb(
-                                    key,
-                                    CachedThumb { w, h, tex },
-                                ),
+                                Some(key) => {
+                                    self.remember_strip_thumb(key, CachedThumb { w, h, tex })
+                                }
                                 None => self.remember_thumb(
                                     res.at_ms,
                                     res.bucket_w,
@@ -3328,7 +3398,9 @@ impl EditorPage {
         // P35：**硬坏段自动跳过**（用户口径：仅硬错误自动跳）。
         // 传空列表时行为与改造前完全一致 —— 干净素材走的正是这条路。
         let skip = self.hard_skip_ranges();
-        let player = if self.play_decode_enabled {
+        // 纯音频素材没有 video stream：只启动音频链，由同一个墙钟推进时间线。
+        // 以前无条件启动视频播放器，线程报"没有视频流"后会停掉整条播放链。
+        let player = if self.play_decode_enabled && clip.video.is_some() {
             match edit::player::PlayerHandle::spawn_skipping(&path, from, w, h, &skip) {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -3346,13 +3418,14 @@ impl EditorPage {
         // ① 素材没有音轨——线程会自行结束，`audio` 停在 Some 也无妨；
         // ② 输出设备打不开——降级为静音播放（日志 + `PlaybackStats::output_live` 留痕）；
         // ③ 线程都没起来——只记日志，画面照播。
-        let audio = match edit::audio_out::AudioTrackHandle::spawn(&path, from, true) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                tracing::warn!(error = %e, "播放：音频输出线程启动失败，本端只有画面");
-                None
-            }
-        };
+        let audio =
+            match edit::audio_out::AudioTrackHandle::spawn(&path, from, self.play_audio_output) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    tracing::warn!(error = %e, "播放：音频输出线程启动失败，本端只有画面");
+                    None
+                }
+            };
         self.play = Some(PlayState {
             player,
             audio,
@@ -3509,11 +3582,8 @@ impl EditorPage {
             // 尺寸没变 → **原地更新**（不重建纹理，省一次 GPU 分配与一次析构）
             Some(t) if t.size() == size => t.set(image, egui::TextureOptions::LINEAR),
             _ => {
-                p.tex = Some(ctx.load_texture(
-                    "cap-editor-play",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ))
+                p.tex =
+                    Some(ctx.load_texture("cap-editor-play", image, egui::TextureOptions::LINEAR))
             }
         }
         p.shown_ms = f.pts_ms;
@@ -3535,15 +3605,19 @@ impl EditorPage {
     /// 收导出结果（非阻塞）
     fn poll_export(&mut self, ctx: &egui::Context) {
         let mut finished = false;
+        let mut outcome: Option<Result<ExportReport, crate::error::AppError>> = None;
         if let Some(rx) = &self.export_rx {
             match rx.try_recv() {
-                Ok(Ok(rep)) => {
-                    self.report = Some(rep);
+                Ok((epoch, Ok(rep))) if epoch == self.export_epoch => {
+                    outcome = Some(Ok(rep));
                     finished = true;
                 }
-                Ok(Err(e)) => {
-                    self.error = Some(self.i18n.tf("err_export_failed", &[&e]));
+                Ok((epoch, Err(e))) if epoch == self.export_epoch => {
+                    outcome = Some(Err(e));
                     finished = true;
+                }
+                Ok(_) => {
+                    // 旧世代结果：丢弃，但不打断当前世代。
                 }
                 Err(TryRecvError::Empty) => ctx.request_repaint(),
                 Err(TryRecvError::Disconnected) => {
@@ -3555,6 +3629,14 @@ impl EditorPage {
         if finished {
             self.export_rx = None;
             self.exporting = false;
+            self.export_cancel = None;
+            match outcome {
+                Some(Ok(rep)) => self.report = Some(rep),
+                Some(Err(e)) => {
+                    self.error = Some(self.i18n.tf("err_export_failed", &[&e]));
+                }
+                None => {}
+            }
         }
     }
 
@@ -3600,6 +3682,11 @@ impl EditorPage {
         };
 
         let (tx, rx) = channel();
+        let export_epoch = self.export_epoch.wrapping_add(1);
+        self.export_epoch = export_epoch;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        self.export_cancel = Some(cancel);
         self.export_rx = Some(rx);
         self.exporting = true;
         // copy 导出不解码，实际就是磁盘拷贝速度；但仍放后台线程避免卡界面
@@ -3607,15 +3694,22 @@ impl EditorPage {
             .name("clip-export".into())
             .spawn(move || {
                 let r = if merged {
-                    edit::export_ranges(&clip, &segments, &dst)
+                    edit::export_ranges_cancel(&clip, &segments, &dst, &cancel_thread)
                 } else {
-                    edit::export_copy(&clip, segments[0].start_ms, segments[0].end_ms, &dst)
+                    edit::export_copy_cancel(
+                        &clip,
+                        segments[0].start_ms,
+                        segments[0].end_ms,
+                        &dst,
+                        &cancel_thread,
+                    )
                 };
-                let _ = tx.send(r);
+                let _ = tx.send((export_epoch, r));
             });
         if spawned.is_err() {
             self.export_rx = None;
             self.exporting = false;
+            self.export_cancel = None;
             self.error = Some(self.i18n.t("err_export_thread").to_string());
         }
     }
@@ -3855,12 +3949,11 @@ impl EditorPage {
             // 「片段列表」行首标签：跟着芯片一起换行（窄窗口时标签单独占第一行也行），
             // 所以它放在 wrapped 流里而不是外面另起一行。
             #[cfg_attr(not(test), allow(unused_variables))]
-            let label_resp = ui
-                .label(
-                    egui::RichText::new(i18n.t("segments_label"))
-                        .size(crate::ui::theme::FS_SMALL)
-                        .color(crate::ui::theme::muted()),
-                );
+            let label_resp = ui.label(
+                egui::RichText::new(i18n.t("segments_label"))
+                    .size(crate::ui::theme::FS_SMALL)
+                    .color(crate::ui::theme::muted()),
+            );
             seg_label = Some(label_resp.rect);
             ui.add_space(8.0);
             for i in 0..n {
@@ -3976,7 +4069,6 @@ impl EditorPage {
         }
     }
 
-
     /// **拖拽排序**：把 `from` 那一段移动到 `to`（插入语义：落在第 `to` 个位置之前）。
     ///
     /// 列表顺序 = 播放顺序，所以这里不做任何时间校验 —— 把 30 秒处的段
@@ -4050,7 +4142,8 @@ impl EditorPage {
         // `request_repaint()` 驱动（L0 每发一档进度、细化每产出一块瓦片各一次），
         // 所以"没有新瓦片时界面就静止"，不会出现"每帧重算"的活锁。
         if self.thumb_pending.is_some() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // ---- **P46：本页不再有任何"自动载入"** ----
@@ -4118,464 +4211,468 @@ impl EditorPage {
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-        // 页面直接以控件开始：**不再有页面标题**（与标签栏里高亮的"剪辑"重复）
-        // 也**不再有那句说明性长句**（用户要求：红色方框内的信息去掉）。
-        // ================= 第 1 行 =================
-        // `[打开视频] [重新载入]` ＋ **同一行右侧**：起点 / 终点（可编辑时间码）+ 选区时长。
-        // （用户给的版式：起点终点与"打开视频"同一行；文件信息挪到最下方，见底部的面板。）
-        // 这一行在"还没打开视频"时也要画（按钮禁用），所以这里先取一次时长与吸附结果。
-        let duration = self
-            .clip
-            .as_ref()
-            .map(|c| c.duration_ms.max(1))
-            .unwrap_or(1);
-        let (eff_ok, selection_ms) = match self.clip.as_ref() {
-            Some(clip) => match edit::effective_range(clip, self.sel_start_ms, self.sel_end_ms) {
-                Ok((a, b)) => (true, b - a),
-                Err(_) => (false, 0),
-            },
-            None => (false, 0),
-        };
-        let has_clip = self.clip.is_some();
-        ui.horizontal_wrapped(|ui| {
-            if crate::ui::theme::ghost_button(ui, i18n.t("btn_open_video")).clicked() {
-                let mut dlg = rfd::FileDialog::new()
-                    .add_filter(i18n.t("dlg_filter_video"), &["mp4", "m4v", "mov"]);
-                if let Some(dir) = self.recording_dir().filter(|d| d.is_dir()) {
-                    dlg = dlg.set_directory(dir);
-                }
-                if let Some(p) = dlg.pick_file() {
-                    self.open(&p);
-                }
-            }
-            if crate::ui::theme::ghost_button(ui, i18n.t("btn_reload")).clicked() {
-                if let Some(p) = self.clip.as_ref().map(|c| c.src.clone()) {
-                    self.open(&p);
-                }
-            }
-            ui.add_space(24.0);
-            ui.add_enabled_ui(has_clip, |ui| {
-                // 起点 / 终点（绿 / 红）：每侧只留一个可编辑时间码框（`HH:MM:SS.mmm`，可拖可输）
-            ui.label(egui::RichText::new(i18n.t("start_point")).color(crate::ui::theme::ok_fg()));
-            timecode_drag(ui, &mut self.sel_start_ms, duration, i18n);
-            ui.add_space(14.0);
-            ui.label(egui::RichText::new(i18n.t("end_point")).color(crate::ui::theme::danger()));
-            timecode_drag(ui, &mut self.sel_end_ms, duration, i18n);
-            ui.add_space(14.0);
-            if !self.segments.is_empty() {
-                // 列表模式：这里显示**合并总时长**（Σ 各段吸附后长度）。
-                // 导出按钮下方还有一份（用户要求），这里留着是因为它紧贴起终点，
-                // 改一段就能立刻看到总长变化。
-                ui.label(
-                    egui::RichText::new(i18n.tf(
-                        "segments_total_ms",
-                        &[&self.segments.len(), &fmt_time(self.segments_total_ms())],
-                    ))
-                    .monospace()
-                    .color(crate::ui::theme::muted()),
-                );
-            } else if eff_ok {
-                ui.label(
-                    egui::RichText::new(i18n.tf("selection_ms", &[&fmt_time(selection_ms)]))
-                        .monospace()
-                        .color(crate::ui::theme::muted()),
-                );
-            } else {
-                ui.label(
-                    egui::RichText::new(i18n.t("selection_invalid"))
-                        .color(crate::ui::theme::err_fg()),
-                );
-            }
-            if let Some(notice) = &self.notice {
-                // 缩略图解码失败之类的问题只是"不影响剪辑"的提示：用低调的横幅
-                let text = notice.clone();
-                theme::banner(ui, theme::Banner::Warn, &text);
-            }
-            }); // add_enabled_ui(has_clip)
-        });
-        self.sel_start_ms = self.sel_start_ms.clamp(0, duration);
-        self.sel_end_ms = self.sel_end_ms.clamp(0, duration);
-
-        // 注：**片段芯片行不在这里**，它跟在下面那排彩色按钮之后（`segment_chips`）。
-        // P36 曾试过把芯片换成时间线上方的**竖向片段列表**（带时长列 + 行内删除），
-        // 实测把最小窗口顶高 118 px（1366×768 装不下），已回退成横向芯片 + 拖拽调序。
-
-        // ---- 错误醒目显示，绝不 panic ----
-        if let Some(err) = &self.error {
-            crate::ui::theme::banner(
-                ui,
-                crate::ui::theme::Banner::Error,
-                &format!("⚠ {err}"),
-            );
-            ui.add_space(crate::ui::theme::GAP_ROW);
-        }
-
-        if self.clip.is_none() {
-            ui.add_space(8.0);
-            // P34：打开在途时说"正在打开…"，而不是误导性的"还没有打开视频"
-            let hint = if self.open_pending_name.is_some() {
-                i18n.t("opening_video")
-            } else {
-                i18n.t("no_video_hint")
-            };
-            ui.label(
-                egui::RichText::new(hint)
-                    .color(crate::ui::theme::muted()),
-            );
-            return;
-        }
-
-        // 时间线的可用宽度：视图行与时间线共用同一个值，保证"铺满"的口径一致
-        let avail_w = ui.available_width().max(MIN_AVAIL_W);
-
-        // ---- 设入点 / 设出点 / 添加片段 / 删除片段（一行四个，外观统一）----
-        //
-        // 全部作用于**当前标尺** `cursor_ms`，不看鼠标位置：鼠标一滑动位置就变，
-        // "去点按钮的路上位置已经移动了"，用户定位不到自己想要的那一帧。
-        //
-        // **P41：四个按钮的配色全部去掉**（用户要求，见 2c.png 红框）。原来是
-        // 绿=设入点 / 红=设出点 / 蓝=添加片段 / 橙=删除片段，现在统一成**中性描边按钮**
-        // （白底 + 发丝描边 + 正文色文字）—— 与同一页「打开视频 / 重新载入」完全一致。
-        // 为什么不保留语义色：这一行的语义已经由**按钮文字本身**说清了（"设入点"就是
-        // 设入点），而四种颜色挤在一行里反而让用户先看颜色、后读字；去掉颜色后
-        // 四个按钮同权重，破坏性操作（删除片段）靠**位置**（行尾）区分。
-        //
-        // 这一行**不再显示**"当前帧 xx:xx"和"将吸附到 …"（用户要求去掉）：
-        // 前者是蓝色标尺的位置，时间线上本来就有；后者是按钮落点的预览，
-        // 而落点规则（起点向右、终点向左吸附）是固定的，不需要每帧念一遍。
-        // "为什么按钮是灰的"这条信息改由 `on_disabled_hover_text` 在悬停时说。
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            // `enabled` 单独传进来（不是靠 `add_enabled_ui` 的副作用）：中性按钮的
-            // **禁用态外观**要显式给一块灰底（egui 的禁用态与静息态同色），
-            // 所以调用方得知道自己这会儿是不是禁用的。
-            let mark_btn = |ui: &mut egui::Ui, text: &str, w: f32, enabled: bool| {
-                ui.add_sized(
-                    [w, 32.0],
-                    crate::ui::theme::neutral_button(ui, text, 15.0, enabled)
-                        .corner_radius(egui::CornerRadius::same(6)),
-                )
-            };
-            // **在用户第一次点击时间线之前禁用**：此时 `cursor_ms` 只是"整片中间"的占位值，
-            // 拿它当用户选的点是错的（用户报的"按钮读的不是我要的点"就是这个坑）。
-            // 按钮的唯一数据来源是 `cursor_ms`，这条路径上**没有任何 hover 回退**。
-            let set_start = ui
-                .add_enabled_ui(self.cursor_committed, |ui| {
-                    mark_btn(ui, i18n.t("btn_set_start"), 96.0, self.cursor_committed)
-                })
-                .inner
-                .on_disabled_hover_text(i18n.t("hint_pick_cursor_first_disabled"));
-            #[cfg(test)]
-            {
-                self.test_rects.set_start_btn = Some(set_start.rect);
-            }
-            if set_start.clicked() {
-                self.mark_start_at_cursor();
-            }
-            ui.add_space(6.0);
-            let set_end = ui
-                .add_enabled_ui(self.cursor_committed, |ui| {
-                    mark_btn(ui, i18n.t("btn_set_end"), 96.0, self.cursor_committed)
-                })
-                .inner
-                .on_disabled_hover_text(i18n.t("hint_pick_cursor_first_disabled"));
-            #[cfg(test)]
-            {
-                self.test_rects.set_end_btn = Some(set_end.rect);
-            }
-            if set_end.clicked() {
-                self.mark_end_at_cursor();
-            }
-            ui.add_space(6.0);
-            // ---- 添加片段 / 删除片段：紧跟在设出点后面（用户要求放这里）----
-            let add_seg = ui
-                .add_enabled_ui(has_clip, |ui| {
-                    mark_btn(ui, i18n.t("btn_add_segment"), 108.0, has_clip)
-                })
-                .inner;
-            #[cfg(test)]
-            {
-                self.test_rects.add_seg_btn = Some(add_seg.rect);
-            }
-            if add_seg.clicked() {
-                self.add_segment();
-            }
-            ui.add_space(6.0);
-            // 列表为空时无处可删（按钮禁用比"点了没反应"更诚实）
-            let del_seg = ui
-                .add_enabled_ui(has_clip && !self.segments.is_empty(), |ui| {
-                    mark_btn(
-                        ui,
-                        i18n.t("btn_del_segment"),
-                        96.0,
-                        has_clip && !self.segments.is_empty(),
-                    )
-                })
-                .inner;
-            #[cfg(test)]
-            {
-                self.test_rects.del_seg_btn = Some(del_seg.rect);
-            }
-            if del_seg.clicked() {
-                self.delete_segment();
-            }
-            // ---- "片段 3/5"：紧跟在四个按钮后面 ----
-            if !self.segments.is_empty() {
-                ui.add_space(10.0);
-                let cur = self
-                    .active_seg
-                    .filter(|&i| i < self.segments.len())
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                ui.label(
-                    egui::RichText::new(i18n.tf(
-                        "segment_active_label",
-                        &[&cur, &self.segments.len()],
-                    ))
-                    .color(crate::ui::theme::muted()),
-                );
-                // P40：片段计数后面跟一句"怎么改顺序"（用户要求）。
-                // 与计数器**同一个条件块**里渲染：`segments` 空时两者一起消失，
-                // 不会给这一行引入新的"条件性部件"（egui 的自动 id 按部件序号递增，
-                // 单独包一个 `if` 会让 id 在有无片段之间错位，见文件末尾那段说明）。
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(i18n.t("segment_drag_hint"))
-                        .size(crate::ui::theme::FS_SMALL)
-                        .color(crate::ui::theme::faint()),
-                );
-            }
-        });
-
-        // ---- **片段芯片行**（有片段时出现）：一个芯片一段 ----
-        //
-        // 点击芯片 = 选中那一段（`sel_*` 载入它的值，时间线上绿/红标尺贴到它两端，
-        // 之后拖把手微调就是改这一段）；**按住芯片左右拖动 = 改合成顺序**。
-        //
-        // 为什么是横向芯片而不是竖向列表：这一行只占约 26 px，而竖向列表至少要 100+ px
-        // —— 页面高度卡得很死（`MIN_INNER_H` 是实测常量），列表会把最小窗口顶高到
-        // 1366×768 装不下的程度。芯片一行放不下时会自动换行（`horizontal_wrapped`）。
-        if !self.segments.is_empty() {
-            ui.add_space(2.0);
-            self.segment_chips(ui, i18n);
-        }
-
-        // 注意：时间线是滚动缩放/拖拽的落点，它依赖"本帧真的被 hover 到"。
-        // 所以上面几行不能条件性地增减**直接挂在整页 Ui 上**的部件——egui 的自动 id
-        // 是按"第几个部件"递增的，一旦错位一帧，这一帧的悬停就会丢（滚轮事件也就丢了）。
-        // 现在只有出错提示是条件渲染的，且它只在真的出错时切换，可以接受。
-        self.timeline(ui, avail_w, i18n);
-
-        // ---- 导出结果卡片：放在预览**之前** ----
-        // 预览吃掉了"时间线以下"的全部剩余高度，所以它后面放不下任何东西（会被推到底部面板
-        // 后面、需要滚动才能看到）。导出汇总放在预览上方，点完「导出」就能直接看到。
-        if let Some(rep) = &self.report {
-            ui.add_space(crate::ui::theme::GAP_ROW);
-            crate::ui::theme::card(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(i18n.t("export_copy_done"))
-                        .color(crate::ui::theme::ok_fg())
-                        .strong(),
-                );
-                ui.add_space(4.0);
-                // 多段合并导出：在文件信息之前先说清"合并了几段、总时长多少"，
-                // 否则单看首尾时间码看不出中间的空洞被跳过了
-                if rep.segments > 1 {
-                    ui.label(crate::ui::theme::mono_muted(&i18n.tf(
-                        "export_result_segments",
-                        &[&rep.segments, &rep.total_duration_ms],
-                    )));
-                }
-                // **P35：被剔除的坏段**必须明说 —— 否则用户会以为导出的就是完整选区
-                if rep.skipped_bad_ms > 0 {
-                    ui.label(
-                        egui::RichText::new(i18n.tf(
-                            "export_skipped_bad",
-                            &[&(rep.skipped_bad_ms as f64 / 1000.0).round()],
-                        ))
-                        .color(bad_hard_color()),
-                    );
-                }
-                ui.label(crate::ui::theme::mono_muted(&i18n.tf(
-                    "export_result_file",
-                    &[&rep.dst.display()],
-                )));
-                ui.label(crate::ui::theme::mono_muted(&i18n.tf(
-                    "export_result_range",
-                    &[
-                        &fmt_time(rep.start_ms),
-                        &fmt_time(rep.end_ms),
-                        &rep.duration_ms(),
-                    ],
-                )));
-                let res_word = if rep.same_resolution {
-                    i18n.t("export_result_same")
-                } else {
-                    i18n.t("export_result_diff")
+                // 页面直接以控件开始：**不再有页面标题**（与标签栏里高亮的"剪辑"重复）
+                // 也**不再有那句说明性长句**（用户要求：红色方框内的信息去掉）。
+                // ================= 第 1 行 =================
+                // `[打开视频] [重新载入]` ＋ **同一行右侧**：起点 / 终点（可编辑时间码）+ 选区时长。
+                // （用户给的版式：起点终点与"打开视频"同一行；文件信息挪到最下方，见底部的面板。）
+                // 这一行在"还没打开视频"时也要画（按钮禁用），所以这里先取一次时长与吸附结果。
+                let duration = self
+                    .clip
+                    .as_ref()
+                    .map(|c| c.duration_ms.max(1))
+                    .unwrap_or(1);
+                let (eff_ok, selection_ms) = match self.clip.as_ref() {
+                    Some(clip) => {
+                        match edit::effective_range(clip, self.sel_start_ms, self.sel_end_ms) {
+                            Ok((a, b)) => (true, b - a),
+                            Err(_) => (false, 0),
+                        }
+                    }
+                    None => (false, 0),
                 };
-                ui.label(crate::ui::theme::mono_muted(&i18n.tf(
-                    "export_result_resolution",
-                    &[
-                        &rep.src_width,
-                        &rep.src_height,
-                        &rep.dst_width,
-                        &rep.dst_height,
-                        &res_word,
-                    ],
-                )));
-                ui.label(crate::ui::theme::mono_muted(&i18n.tf(
-                    "export_result_size",
-                    &[&rep.dst_duration_ms, &rep.packets, &rep.bytes],
-                )));
-            });
-        }
+                let has_clip = self.clip.is_some();
+                ui.horizontal_wrapped(|ui| {
+                    if crate::ui::theme::ghost_button(ui, i18n.t("btn_open_video")).clicked() {
+                        let mut dlg = rfd::FileDialog::new()
+                            .add_filter(i18n.t("dlg_filter_video"), &["mp4", "m4v", "mov"]);
+                        if let Some(dir) = self.recording_dir().filter(|d| d.is_dir()) {
+                            dlg = dlg.set_directory(dir);
+                        }
+                        if let Some(p) = dlg.pick_file() {
+                            self.open(&p);
+                        }
+                    }
+                    if crate::ui::theme::ghost_button(ui, i18n.t("btn_reload")).clicked() {
+                        if let Some(p) = self.clip.as_ref().map(|c| c.src.clone()) {
+                            self.open(&p);
+                        }
+                    }
+                    ui.add_space(24.0);
+                    ui.add_enabled_ui(has_clip, |ui| {
+                        // 起点 / 终点（绿 / 红）：每侧只留一个可编辑时间码框（`HH:MM:SS.mmm`，可拖可输）
+                        ui.label(
+                            egui::RichText::new(i18n.t("start_point"))
+                                .color(crate::ui::theme::ok_fg()),
+                        );
+                        timecode_drag(ui, &mut self.sel_start_ms, duration, i18n);
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(i18n.t("end_point"))
+                                .color(crate::ui::theme::danger()),
+                        );
+                        timecode_drag(ui, &mut self.sel_end_ms, duration, i18n);
+                        ui.add_space(14.0);
+                        if !self.segments.is_empty() {
+                            // 列表模式：这里显示**合并总时长**（Σ 各段吸附后长度）。
+                            // 导出按钮下方还有一份（用户要求），这里留着是因为它紧贴起终点，
+                            // 改一段就能立刻看到总长变化。
+                            ui.label(
+                                egui::RichText::new(i18n.tf(
+                                    "segments_total_ms",
+                                    &[&self.segments.len(), &fmt_time(self.segments_total_ms())],
+                                ))
+                                .monospace()
+                                .color(crate::ui::theme::muted()),
+                            );
+                        } else if eff_ok {
+                            ui.label(
+                                egui::RichText::new(
+                                    i18n.tf("selection_ms", &[&fmt_time(selection_ms)]),
+                                )
+                                .monospace()
+                                .color(crate::ui::theme::muted()),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(i18n.t("selection_invalid"))
+                                    .color(crate::ui::theme::err_fg()),
+                            );
+                        }
+                        if let Some(notice) = &self.notice {
+                            // 缩略图解码失败之类的问题只是"不影响剪辑"的提示：用低调的横幅
+                            let text = notice.clone();
+                            theme::banner(ui, theme::Banner::Warn, &text);
+                        }
+                    }); // add_enabled_ui(has_clip)
+                });
+                self.sel_start_ms = self.sel_start_ms.clamp(0, duration);
+                self.sel_end_ms = self.sel_end_ms.clamp(0, duration);
 
-        // ---- 当前帧预览（**流式**）+ 「导出」按钮 ----
-        //
-        // 尺寸规则（**唯一口径**见 [`fluid_preview_size`]，注释里有完整取舍）：
-        // * **以高度为准**：`preview_h = 可用高度`（不足 200 时取 200），
-        //   `preview_w = preview_h × 源宽/源高` —— 画框比例恒等于源比例，
-        //   所以既不拉伸、不裁剪，也不留黑边；
-        // * **可用高度**：滚动区里"时间线以下"的剩余高度（`ui.available_height()`），
-        //   减去**预览下方必须留出的固定内容**——预览自己那行时间码（+间距）；
-        //   "文件信息行 + 操作指南行"这两个底部面板**在进入本函数前就已经把高度占掉了**，
-        //   所以 `available_height()` 里天然不含它们（再减一次反而会在两行之间留出空白）；
-        //   窗口太窄、按钮换到预览下方时，还要再给按钮留出高度（否则按钮会被裁掉）。
-        // * **宽度受限**：`preview_w` 超过"预览能用的宽度"时，先按宽度收敛
-        //   （`preview_w = 可用宽度`、`preview_h = preview_w × 源高/源宽`），
-        //   **只有在收敛后的高度仍 ≥ 200 时才接受**；否则**保持"以高度为准"的结果**
-        //   （宽度超出可用宽度 → 横向裁切/滚动），两种情况都严格保持源比例。
-        ui.add_space(crate::ui::theme::GAP_ROW);
-        let btn_w = EXPORT_BTN_W;
-        let page_w = ui.available_width().max(MIN_AVAIL_W);
-        // 同排时预览右侧要让出"间距 + 按钮列"；让完之后预览连 240px 都不到，就把整列换行到下方
-        let side_col_w = PREVIEW_EXPORT_GAP + btn_w;
-        // 预览下方固定内容：一行时间码（+间距）；按钮列换行到下方时再加上整列
-        let caption_h = ui
-            .ctx()
-            .fonts_mut(|f| f.row_height(&egui::FontId::monospace(12.0)))
-            + PREVIEW_CAPTION_GAP;
-        // ---- 右列（自上而下）：**时间码 / 播放·停止 / 导出** ----
-        //
-        // 用户口径：绿色播放按钮在「导出」**正上方**，时间码在播放按钮**正上方**。
-        // 三件东西作为**一列整体**与预览垂直居中 —— 而不是让「导出」单独居中：
-        // 那样播放按钮会被顶出预览上边界（用户看到的就是"按钮浮在画框外面"）。
-        let btn_h = crate::ui::theme::H_PRIMARY;
-        let col_gap = crate::ui::theme::GAP_ROW;
-        let code_h = caption_h;
-        let col_h = code_h + col_gap + btn_h + col_gap + btn_h;
-        // ---- 「导出」按钮放哪：右侧，还是换行到预览下方？----
-        //
-        // 换行的判据有**两条**，第二条必须用**算出来的预览宽度**判，不能只看可用宽度：
-        // ① 页面太窄：让出右侧那一列之后预览连 `PREVIEW_SIDE_BTN_MIN_W` 都不到；
-        // ② **极宽画幅**（例如 32:9）保高度下限时，预览宽度由"高度 × 源比例"推出，
-        //    可能比可用宽度还宽（`fluid_preview_size` 规则 3 允许）—— 这时右侧那一列
-        //    根本放不下，不换行就会把按钮**挤出窗口右边界**（旧代码只有判据 ①，
-        //    32:9 + 窄窗口下按钮真的会被挤没，见单测 `headless_editor_*` 的极宽画幅一节）。
-        //
-        // 试算最多两轮：第一轮按"按钮在右侧"算预览；放不下就翻成"按钮在下方"再算一次
-        //（`btn_below` 只会从 false 翻到 true，所以一轮足够，写成循环只是为了不重复代码）。
-        let mut btn_below = page_w - side_col_w < PREVIEW_SIDE_BTN_MIN_W;
-        let remaining_h = ui.available_height();
-        // 一轮试算：给定"按钮是否换行到下方"，算出（预览可用宽度、预览可用高度、预览尺寸）
-        let attempt = |btn_below: bool| -> (f32, f32, egui::Vec2) {
-            let max_w = if btn_below {
-                page_w
-            } else {
-                (page_w - side_col_w).max(1.0)
-            };
-            let fixed_below = if btn_below {
-                // 预览下方的固定内容：时间码行 + 整列（时间码 / 播放 / 导出）
-                caption_h + col_gap + col_h
-            } else {
-                caption_h
-            };
-            let avail_h = preview_avail_h(remaining_h, fixed_below);
-            (max_w, avail_h, self.preview_size(avail_h, max_w))
-        };
-        let (mut _max_w, mut _avail_h, mut size) = attempt(btn_below);
-        // 判据 ②：算出来的预览宽度 + "间距 + 按钮"放不进页宽（极宽画幅保高度下限时会发生）
-        // → 按钮换行到预览下方，再算一次（下方永远放得下）
-        if !btn_below && size.x + side_col_w > page_w + 0.5 {
-            btn_below = true;
-            let (w, h, s) = attempt(true);
-            _max_w = w;
-            _avail_h = h;
-            size = s;
-        }
-        // `_max_w` / `_avail_h` 只有无窗口单测读（非测试构建里就是"没用到的中间量"，
-        // 加下划线前缀是**故意**的：见下面 `#[cfg(test)]` 块）
-        #[cfg(test)]
-        {
-            self.test_rects.preview_avail_h = Some(_avail_h);
-            self.test_rects.preview_avail_w = Some(_max_w);
-        }
-        // 整组（预览 + 按钮）仍然**水平居中**：先算组宽再在左侧补一段空白。
-        // 这一整行的矩形**自己算**（而不是靠 `ui.horizontal` / `ui.vertical` 推着走）：
-        // 预览是流式的，"导出"按钮必须精确落在预览右侧、与预览垂直居中，
-        // 而且**绝不能被越变越宽的预览挤出视野** —— 这些都必须是算术上的保证。
-        let group_w = if btn_below {
-            size.x
-        } else {
-            size.x + side_col_w
-        };
-        let pad = ((page_w - group_w) / 2.0).max(0.0);
-        let row_h = size.y + caption_h;
-        let block_h = if btn_below {
-            row_h + col_gap + col_h
-        } else {
-            row_h
-        };
-        let (block, _) = ui.allocate_exact_size(egui::vec2(page_w, block_h), egui::Sense::hover());
-        // 子 Ui 只用来放这一行里的部件（不参与父级布局推进，位置全部显式给矩形）
-        let mut row = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(block)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        let frame = egui::Rect::from_min_size(
-            egui::pos2(block.left() + pad, block.top()),
-            size,
-        );
-        self.paint_preview(&mut row, frame, caption_h, i18n);
-        // ---- 右列三件：时间码 / 播放·停止 / 导出 ----
-        //
-        // 常态：整列贴预览右侧、与预览**垂直居中**；窄窗口：整列换行到预览下方。
-        // 位置全部由矩形算术给出（不靠布局游标），所以预览再怎么流式变化，
-        // 这一列也不会被推着跑、更不会被挤出视野。
-        let col_left = if btn_below {
-            frame.left()
-        } else {
-            frame.right() + PREVIEW_EXPORT_GAP
-        };
-        let col_top = if btn_below {
-            frame.bottom() + caption_h + col_gap
-        } else {
-            // 预览最矮也有 `PREVIEW_MIN_H`(200) > `col_h`，所以这个 max 只是护栏
-            (frame.center().y - col_h / 2.0).max(frame.top())
-        };
-        let code_rect = egui::Rect::from_min_size(
-            egui::pos2(col_left, col_top),
-            egui::vec2(btn_w, code_h),
-        );
-        let play_rect = egui::Rect::from_min_size(
-            egui::pos2(col_left, code_rect.bottom() + col_gap),
-            egui::vec2(btn_w, btn_h),
-        );
-        let btn_rect = egui::Rect::from_min_size(
-            egui::pos2(col_left, play_rect.bottom() + col_gap),
-            egui::vec2(btn_w, btn_h),
-        );
-        self.playback_controls(&mut row, code_rect, play_rect, i18n);
-        self.export_button(&mut row, btn_rect);
-        // **预览块之后不再 add_space**：这一块的高度就是"滚动区里剩下的全部高度"
-        // （`block_h = size.y + caption_h = ui.available_height()`），再补一段间距就等于
-        // 让内容**必然**比视口高出那一段 —— 那样即便窗口很高，这一页也会**一直**挂着
-        // 一条纵向滚动条（用户报的"取消上下滚动条"就是这个现象的根源）。
-        // 也就是说：下面这个 `_scroll` 的 `content_size.y` 现在正好等于 `inner_rect.height()`，
-        // 单测 `headless_editor_required_height_fits_the_min_window` 断言了这一点。
-        }); // ScrollArea
-        // 本帧的布局测量（最小窗口尺寸 `ui::layout::MIN_INNER_H` 就是用它实测出来的）
+                // 注：**片段芯片行不在这里**，它跟在下面那排彩色按钮之后（`segment_chips`）。
+                // P36 曾试过把芯片换成时间线上方的**竖向片段列表**（带时长列 + 行内删除），
+                // 实测把最小窗口顶高 118 px（1366×768 装不下），已回退成横向芯片 + 拖拽调序。
+
+                // ---- 错误醒目显示，绝不 panic ----
+                if let Some(err) = &self.error {
+                    crate::ui::theme::banner(
+                        ui,
+                        crate::ui::theme::Banner::Error,
+                        &format!("⚠ {err}"),
+                    );
+                    ui.add_space(crate::ui::theme::GAP_ROW);
+                }
+
+                if self.clip.is_none() {
+                    ui.add_space(8.0);
+                    // P34：打开在途时说"正在打开…"，而不是误导性的"还没有打开视频"
+                    let hint = if self.open_pending_name.is_some() {
+                        i18n.t("opening_video")
+                    } else {
+                        i18n.t("no_video_hint")
+                    };
+                    ui.label(egui::RichText::new(hint).color(crate::ui::theme::muted()));
+                    return;
+                }
+
+                // 时间线的可用宽度：视图行与时间线共用同一个值，保证"铺满"的口径一致
+                let avail_w = ui.available_width().max(MIN_AVAIL_W);
+
+                // ---- 设入点 / 设出点 / 添加片段 / 删除片段（一行四个，外观统一）----
+                //
+                // 全部作用于**当前标尺** `cursor_ms`，不看鼠标位置：鼠标一滑动位置就变，
+                // "去点按钮的路上位置已经移动了"，用户定位不到自己想要的那一帧。
+                //
+                // **P41：四个按钮的配色全部去掉**（用户要求，见 2c.png 红框）。原来是
+                // 绿=设入点 / 红=设出点 / 蓝=添加片段 / 橙=删除片段，现在统一成**中性描边按钮**
+                // （白底 + 发丝描边 + 正文色文字）—— 与同一页「打开视频 / 重新载入」完全一致。
+                // 为什么不保留语义色：这一行的语义已经由**按钮文字本身**说清了（"设入点"就是
+                // 设入点），而四种颜色挤在一行里反而让用户先看颜色、后读字；去掉颜色后
+                // 四个按钮同权重，破坏性操作（删除片段）靠**位置**（行尾）区分。
+                //
+                // 这一行**不再显示**"当前帧 xx:xx"和"将吸附到 …"（用户要求去掉）：
+                // 前者是蓝色标尺的位置，时间线上本来就有；后者是按钮落点的预览，
+                // 而落点规则（起点向右、终点向左吸附）是固定的，不需要每帧念一遍。
+                // "为什么按钮是灰的"这条信息改由 `on_disabled_hover_text` 在悬停时说。
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    // `enabled` 单独传进来（不是靠 `add_enabled_ui` 的副作用）：中性按钮的
+                    // **禁用态外观**要显式给一块灰底（egui 的禁用态与静息态同色），
+                    // 所以调用方得知道自己这会儿是不是禁用的。
+                    let mark_btn = |ui: &mut egui::Ui, text: &str, w: f32, enabled: bool| {
+                        ui.add_sized(
+                            [w, 32.0],
+                            crate::ui::theme::neutral_button(ui, text, 15.0, enabled)
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
+                    };
+                    // **在用户第一次点击时间线之前禁用**：此时 `cursor_ms` 只是"整片中间"的占位值，
+                    // 拿它当用户选的点是错的（用户报的"按钮读的不是我要的点"就是这个坑）。
+                    // 按钮的唯一数据来源是 `cursor_ms`，这条路径上**没有任何 hover 回退**。
+                    let set_start = ui
+                        .add_enabled_ui(self.cursor_committed, |ui| {
+                            mark_btn(ui, i18n.t("btn_set_start"), 96.0, self.cursor_committed)
+                        })
+                        .inner
+                        .on_disabled_hover_text(i18n.t("hint_pick_cursor_first_disabled"));
+                    #[cfg(test)]
+                    {
+                        self.test_rects.set_start_btn = Some(set_start.rect);
+                    }
+                    if set_start.clicked() {
+                        self.mark_start_at_cursor();
+                    }
+                    ui.add_space(6.0);
+                    let set_end = ui
+                        .add_enabled_ui(self.cursor_committed, |ui| {
+                            mark_btn(ui, i18n.t("btn_set_end"), 96.0, self.cursor_committed)
+                        })
+                        .inner
+                        .on_disabled_hover_text(i18n.t("hint_pick_cursor_first_disabled"));
+                    #[cfg(test)]
+                    {
+                        self.test_rects.set_end_btn = Some(set_end.rect);
+                    }
+                    if set_end.clicked() {
+                        self.mark_end_at_cursor();
+                    }
+                    ui.add_space(6.0);
+                    // ---- 添加片段 / 删除片段：紧跟在设出点后面（用户要求放这里）----
+                    let add_seg = ui
+                        .add_enabled_ui(has_clip, |ui| {
+                            mark_btn(ui, i18n.t("btn_add_segment"), 108.0, has_clip)
+                        })
+                        .inner;
+                    #[cfg(test)]
+                    {
+                        self.test_rects.add_seg_btn = Some(add_seg.rect);
+                    }
+                    if add_seg.clicked() {
+                        self.add_segment();
+                    }
+                    ui.add_space(6.0);
+                    // 列表为空时无处可删（按钮禁用比"点了没反应"更诚实）
+                    let del_seg = ui
+                        .add_enabled_ui(has_clip && !self.segments.is_empty(), |ui| {
+                            mark_btn(
+                                ui,
+                                i18n.t("btn_del_segment"),
+                                96.0,
+                                has_clip && !self.segments.is_empty(),
+                            )
+                        })
+                        .inner;
+                    #[cfg(test)]
+                    {
+                        self.test_rects.del_seg_btn = Some(del_seg.rect);
+                    }
+                    if del_seg.clicked() {
+                        self.delete_segment();
+                    }
+                    // ---- "片段 3/5"：紧跟在四个按钮后面 ----
+                    if !self.segments.is_empty() {
+                        ui.add_space(10.0);
+                        let cur = self
+                            .active_seg
+                            .filter(|&i| i < self.segments.len())
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        ui.label(
+                            egui::RichText::new(
+                                i18n.tf("segment_active_label", &[&cur, &self.segments.len()]),
+                            )
+                            .color(crate::ui::theme::muted()),
+                        );
+                        // P40：片段计数后面跟一句"怎么改顺序"（用户要求）。
+                        // 与计数器**同一个条件块**里渲染：`segments` 空时两者一起消失，
+                        // 不会给这一行引入新的"条件性部件"（egui 的自动 id 按部件序号递增，
+                        // 单独包一个 `if` 会让 id 在有无片段之间错位，见文件末尾那段说明）。
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(i18n.t("segment_drag_hint"))
+                                .size(crate::ui::theme::FS_SMALL)
+                                .color(crate::ui::theme::faint()),
+                        );
+                    }
+                });
+
+                // ---- **片段芯片行**（有片段时出现）：一个芯片一段 ----
+                //
+                // 点击芯片 = 选中那一段（`sel_*` 载入它的值，时间线上绿/红标尺贴到它两端，
+                // 之后拖把手微调就是改这一段）；**按住芯片左右拖动 = 改合成顺序**。
+                //
+                // 为什么是横向芯片而不是竖向列表：这一行只占约 26 px，而竖向列表至少要 100+ px
+                // —— 页面高度卡得很死（`MIN_INNER_H` 是实测常量），列表会把最小窗口顶高到
+                // 1366×768 装不下的程度。芯片一行放不下时会自动换行（`horizontal_wrapped`）。
+                if !self.segments.is_empty() {
+                    ui.add_space(2.0);
+                    self.segment_chips(ui, i18n);
+                }
+
+                // 注意：时间线是滚动缩放/拖拽的落点，它依赖"本帧真的被 hover 到"。
+                // 所以上面几行不能条件性地增减**直接挂在整页 Ui 上**的部件——egui 的自动 id
+                // 是按"第几个部件"递增的，一旦错位一帧，这一帧的悬停就会丢（滚轮事件也就丢了）。
+                // 现在只有出错提示是条件渲染的，且它只在真的出错时切换，可以接受。
+                self.timeline(ui, avail_w, i18n);
+
+                // ---- 导出结果卡片：放在预览**之前** ----
+                // 预览吃掉了"时间线以下"的全部剩余高度，所以它后面放不下任何东西（会被推到底部面板
+                // 后面、需要滚动才能看到）。导出汇总放在预览上方，点完「导出」就能直接看到。
+                if let Some(rep) = &self.report {
+                    ui.add_space(crate::ui::theme::GAP_ROW);
+                    crate::ui::theme::card(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(i18n.t("export_copy_done"))
+                                .color(crate::ui::theme::ok_fg())
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
+                        // 多段合并导出：在文件信息之前先说清"合并了几段、总时长多少"，
+                        // 否则单看首尾时间码看不出中间的空洞被跳过了
+                        if rep.segments > 1 {
+                            ui.label(crate::ui::theme::mono_muted(&i18n.tf(
+                                "export_result_segments",
+                                &[&rep.segments, &rep.total_duration_ms],
+                            )));
+                        }
+                        // **P35：被剔除的坏段**必须明说 —— 否则用户会以为导出的就是完整选区
+                        if rep.skipped_bad_ms > 0 {
+                            ui.label(
+                                egui::RichText::new(i18n.tf(
+                                    "export_skipped_bad",
+                                    &[&(rep.skipped_bad_ms as f64 / 1000.0).round()],
+                                ))
+                                .color(bad_hard_color()),
+                            );
+                        }
+                        ui.label(crate::ui::theme::mono_muted(
+                            &i18n.tf("export_result_file", &[&rep.dst.display()]),
+                        ));
+                        ui.label(crate::ui::theme::mono_muted(&i18n.tf(
+                            "export_result_range",
+                            &[
+                                &fmt_time(rep.start_ms),
+                                &fmt_time(rep.end_ms),
+                                &rep.duration_ms(),
+                            ],
+                        )));
+                        let res_word = if rep.same_resolution {
+                            i18n.t("export_result_same")
+                        } else {
+                            i18n.t("export_result_diff")
+                        };
+                        ui.label(crate::ui::theme::mono_muted(&i18n.tf(
+                            "export_result_resolution",
+                            &[
+                                &rep.src_width,
+                                &rep.src_height,
+                                &rep.dst_width,
+                                &rep.dst_height,
+                                &res_word,
+                            ],
+                        )));
+                        ui.label(crate::ui::theme::mono_muted(&i18n.tf(
+                            "export_result_size",
+                            &[&rep.dst_duration_ms, &rep.packets, &rep.bytes],
+                        )));
+                    });
+                }
+
+                // ---- 当前帧预览（**流式**）+ 「导出」按钮 ----
+                //
+                // 尺寸规则（**唯一口径**见 [`fluid_preview_size`]，注释里有完整取舍）：
+                // * **以高度为准**：`preview_h = 可用高度`（不足 200 时取 200），
+                //   `preview_w = preview_h × 源宽/源高` —— 画框比例恒等于源比例，
+                //   所以既不拉伸、不裁剪，也不留黑边；
+                // * **可用高度**：滚动区里"时间线以下"的剩余高度（`ui.available_height()`），
+                //   减去**预览下方必须留出的固定内容**——预览自己那行时间码（+间距）；
+                //   "文件信息行 + 操作指南行"这两个底部面板**在进入本函数前就已经把高度占掉了**，
+                //   所以 `available_height()` 里天然不含它们（再减一次反而会在两行之间留出空白）；
+                //   窗口太窄、按钮换到预览下方时，还要再给按钮留出高度（否则按钮会被裁掉）。
+                // * **宽度受限**：`preview_w` 超过"预览能用的宽度"时，先按宽度收敛
+                //   （`preview_w = 可用宽度`、`preview_h = preview_w × 源高/源宽`），
+                //   **只有在收敛后的高度仍 ≥ 200 时才接受**；否则**保持"以高度为准"的结果**
+                //   （宽度超出可用宽度 → 横向裁切/滚动），两种情况都严格保持源比例。
+                ui.add_space(crate::ui::theme::GAP_ROW);
+                let btn_w = EXPORT_BTN_W;
+                let page_w = ui.available_width().max(MIN_AVAIL_W);
+                // 同排时预览右侧要让出"间距 + 按钮列"；让完之后预览连 240px 都不到，就把整列换行到下方
+                let side_col_w = PREVIEW_EXPORT_GAP + btn_w;
+                // 预览下方固定内容：一行时间码（+间距）；按钮列换行到下方时再加上整列
+                let caption_h = ui
+                    .ctx()
+                    .fonts_mut(|f| f.row_height(&egui::FontId::monospace(12.0)))
+                    + PREVIEW_CAPTION_GAP;
+                // ---- 右列（自上而下）：**时间码 / 播放·停止 / 导出** ----
+                //
+                // 用户口径：绿色播放按钮在「导出」**正上方**，时间码在播放按钮**正上方**。
+                // 三件东西作为**一列整体**与预览垂直居中 —— 而不是让「导出」单独居中：
+                // 那样播放按钮会被顶出预览上边界（用户看到的就是"按钮浮在画框外面"）。
+                let btn_h = crate::ui::theme::H_PRIMARY;
+                let col_gap = crate::ui::theme::GAP_ROW;
+                let code_h = caption_h;
+                let col_h = code_h + col_gap + btn_h + col_gap + btn_h;
+                // ---- 「导出」按钮放哪：右侧，还是换行到预览下方？----
+                //
+                // 换行的判据有**两条**，第二条必须用**算出来的预览宽度**判，不能只看可用宽度：
+                // ① 页面太窄：让出右侧那一列之后预览连 `PREVIEW_SIDE_BTN_MIN_W` 都不到；
+                // ② **极宽画幅**（例如 32:9）保高度下限时，预览宽度由"高度 × 源比例"推出，
+                //    可能比可用宽度还宽（`fluid_preview_size` 规则 3 允许）—— 这时右侧那一列
+                //    根本放不下，不换行就会把按钮**挤出窗口右边界**（旧代码只有判据 ①，
+                //    32:9 + 窄窗口下按钮真的会被挤没，见单测 `headless_editor_*` 的极宽画幅一节）。
+                //
+                // 试算最多两轮：第一轮按"按钮在右侧"算预览；放不下就翻成"按钮在下方"再算一次
+                //（`btn_below` 只会从 false 翻到 true，所以一轮足够，写成循环只是为了不重复代码）。
+                let mut btn_below = page_w - side_col_w < PREVIEW_SIDE_BTN_MIN_W;
+                let remaining_h = ui.available_height();
+                // 一轮试算：给定"按钮是否换行到下方"，算出（预览可用宽度、预览可用高度、预览尺寸）
+                let attempt = |btn_below: bool| -> (f32, f32, egui::Vec2) {
+                    let max_w = if btn_below {
+                        page_w
+                    } else {
+                        (page_w - side_col_w).max(1.0)
+                    };
+                    let fixed_below = if btn_below {
+                        // 预览下方的固定内容：时间码行 + 整列（时间码 / 播放 / 导出）
+                        caption_h + col_gap + col_h
+                    } else {
+                        caption_h
+                    };
+                    let avail_h = preview_avail_h(remaining_h, fixed_below);
+                    (max_w, avail_h, self.preview_size(avail_h, max_w))
+                };
+                let (mut _max_w, mut _avail_h, mut size) = attempt(btn_below);
+                // 判据 ②：算出来的预览宽度 + "间距 + 按钮"放不进页宽（极宽画幅保高度下限时会发生）
+                // → 按钮换行到预览下方，再算一次（下方永远放得下）
+                if !btn_below && size.x + side_col_w > page_w + 0.5 {
+                    btn_below = true;
+                    let (w, h, s) = attempt(true);
+                    _max_w = w;
+                    _avail_h = h;
+                    size = s;
+                }
+                // `_max_w` / `_avail_h` 只有无窗口单测读（非测试构建里就是"没用到的中间量"，
+                // 加下划线前缀是**故意**的：见下面 `#[cfg(test)]` 块）
+                #[cfg(test)]
+                {
+                    self.test_rects.preview_avail_h = Some(_avail_h);
+                    self.test_rects.preview_avail_w = Some(_max_w);
+                }
+                // 整组（预览 + 按钮）仍然**水平居中**：先算组宽再在左侧补一段空白。
+                // 这一整行的矩形**自己算**（而不是靠 `ui.horizontal` / `ui.vertical` 推着走）：
+                // 预览是流式的，"导出"按钮必须精确落在预览右侧、与预览垂直居中，
+                // 而且**绝不能被越变越宽的预览挤出视野** —— 这些都必须是算术上的保证。
+                let group_w = if btn_below {
+                    size.x
+                } else {
+                    size.x + side_col_w
+                };
+                let pad = ((page_w - group_w) / 2.0).max(0.0);
+                let row_h = size.y + caption_h;
+                let block_h = if btn_below {
+                    row_h + col_gap + col_h
+                } else {
+                    row_h
+                };
+                let (block, _) =
+                    ui.allocate_exact_size(egui::vec2(page_w, block_h), egui::Sense::hover());
+                // 子 Ui 只用来放这一行里的部件（不参与父级布局推进，位置全部显式给矩形）
+                let mut row = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(block)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let frame =
+                    egui::Rect::from_min_size(egui::pos2(block.left() + pad, block.top()), size);
+                self.paint_preview(&mut row, frame, caption_h, i18n);
+                // ---- 右列三件：时间码 / 播放·停止 / 导出 ----
+                //
+                // 常态：整列贴预览右侧、与预览**垂直居中**；窄窗口：整列换行到预览下方。
+                // 位置全部由矩形算术给出（不靠布局游标），所以预览再怎么流式变化，
+                // 这一列也不会被推着跑、更不会被挤出视野。
+                let col_left = if btn_below {
+                    frame.left()
+                } else {
+                    frame.right() + PREVIEW_EXPORT_GAP
+                };
+                let col_top = if btn_below {
+                    frame.bottom() + caption_h + col_gap
+                } else {
+                    // 预览最矮也有 `PREVIEW_MIN_H`(200) > `col_h`，所以这个 max 只是护栏
+                    (frame.center().y - col_h / 2.0).max(frame.top())
+                };
+                let code_rect = egui::Rect::from_min_size(
+                    egui::pos2(col_left, col_top),
+                    egui::vec2(btn_w, code_h),
+                );
+                let play_rect = egui::Rect::from_min_size(
+                    egui::pos2(col_left, code_rect.bottom() + col_gap),
+                    egui::vec2(btn_w, btn_h),
+                );
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(col_left, play_rect.bottom() + col_gap),
+                    egui::vec2(btn_w, btn_h),
+                );
+                self.playback_controls(&mut row, code_rect, play_rect, i18n);
+                self.export_button(&mut row, btn_rect);
+                // **预览块之后不再 add_space**：这一块的高度就是"滚动区里剩下的全部高度"
+                // （`block_h = size.y + caption_h = ui.available_height()`），再补一段间距就等于
+                // 让内容**必然**比视口高出那一段 —— 那样即便窗口很高，这一页也会**一直**挂着
+                // 一条纵向滚动条（用户报的"取消上下滚动条"就是这个现象的根源）。
+                // 也就是说：下面这个 `_scroll` 的 `content_size.y` 现在正好等于 `inner_rect.height()`，
+                // 单测 `headless_editor_required_height_fits_the_min_window` 断言了这一点。
+            }); // ScrollArea
+                // 本帧的布局测量（最小窗口尺寸 `ui::layout::MIN_INNER_H` 就是用它实测出来的）
         self.probe = LayoutProbe {
             content_h: _scroll.content_size.y,
             viewport_h: _scroll.inner_rect.height(),
@@ -4675,11 +4772,12 @@ impl EditorPage {
         } else {
             // 单段模式：与列表模式同位置、同口径
             let (es, ee) = match self.clip.as_ref() {
-                Some(c) => edit::effective_range(c, self.sel_start_ms, self.sel_end_ms)
-                    .unwrap_or((
+                Some(c) => {
+                    edit::effective_range(c, self.sel_start_ms, self.sel_end_ms).unwrap_or((
                         edit::snap_start(c, self.sel_start_ms),
                         edit::snap_end(c, self.sel_end_ms),
-                    )),
+                    ))
+                }
                 None => (self.sel_start_ms, self.sel_end_ms),
             };
             Some(self.i18n.tf("selection_ms", &[&fmt_time((ee - es).max(0))]))
@@ -4758,7 +4856,11 @@ impl EditorPage {
             let bad_hard = health.bad.iter().filter(|b| b.kind.is_hard()).count();
             let deep_checking = self.deep_checking;
             let deep_pct = if deep_checking {
-                let total = self.clip.as_ref().map(|c| c.duration_ms.max(1)).unwrap_or(1);
+                let total = self
+                    .clip
+                    .as_ref()
+                    .map(|c| c.duration_ms.max(1))
+                    .unwrap_or(1);
                 ((self.deep_progress_ms as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as i32
             } else {
                 100
@@ -4795,7 +4897,8 @@ impl EditorPage {
                 None
             };
             let deep_label = if deep_checking {
-                self.i18n.tf("health_deep_running", &[&deep_pct.to_string()])
+                self.i18n
+                    .tf("health_deep_running", &[&deep_pct.to_string()])
             } else {
                 self.i18n.t("health_deep_btn").to_string()
             };
@@ -4814,13 +4917,9 @@ impl EditorPage {
                     // 与"刚好一行文字"的口径冲突；窗口过窄时右端被面板裁掉即可
                     // （与上面指南行的 `truncate` 同一个取舍：宁可省略，不要撑高）。
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(file_name).color(crate::ui::theme::text()),
-                        );
+                        ui.label(egui::RichText::new(file_name).color(crate::ui::theme::text()));
                         ui.add_space(10.0);
-                        ui.label(
-                            crate::ui::theme::mono_muted(&fmt_time(duration_ms)),
-                        );
+                        ui.label(crate::ui::theme::mono_muted(&fmt_time(duration_ms)));
                         if let Some((w, h, fps, codec)) = &video_info {
                             ui.add_space(10.0);
                             ui.label(crate::ui::theme::mono_muted(&format!("{w}×{h}")));
@@ -4972,10 +5071,14 @@ impl EditorPage {
         // （主题里是 3px），那 3px 会被算进时间线总高、也会让刻度尺带与位置行之间出现一条缝
         //（单测 `p14_pos_row_*` 断言"时间线高 = 各段之和"时抓到的就是它）。
         ui.spacing_mut().item_spacing.y = 0.0;
-        let (timeline_rect, resp) =
-            ui.allocate_exact_size(egui::vec2(avail_w, timeline_h), egui::Sense::click_and_drag());
-        let (pos_rect, pos_resp) =
-            ui.allocate_exact_size(egui::vec2(avail_w, POS_ROW_H), egui::Sense::click_and_drag());
+        let (timeline_rect, resp) = ui.allocate_exact_size(
+            egui::vec2(avail_w, timeline_h),
+            egui::Sense::click_and_drag(),
+        );
+        let (pos_rect, pos_resp) = ui.allocate_exact_size(
+            egui::vec2(avail_w, POS_ROW_H),
+            egui::Sense::click_and_drag(),
+        );
         // `rect` = **整条时间线**（含位置行）：绘制、时间→x 换算、单测的 `test_rects.timeline`
         // 都继续用它，于是"时间线整体"在视觉与坐标上仍然是原来那一整块。
         let rect = egui::Rect::from_min_max(
@@ -5090,12 +5193,7 @@ impl EditorPage {
         // （缩放把视口搬走之后，见 [`page_view_start`] 的左边界分支）。
         // 整片铺满（`fit_mode`）时全片都在眼前，没有"翻页"可言 —— 不动。
         if self.is_playing() && !self.fit_mode {
-            if let Some(new_vs) = page_view_start(
-                self.cursor_ms as f64,
-                vs,
-                visible_ms,
-                max_view,
-            ) {
+            if let Some(new_vs) = page_view_start(self.cursor_ms as f64, vs, visible_ms, max_view) {
                 vs = new_vs;
                 self.view_start_ms = vs;
             }
@@ -5519,15 +5617,11 @@ impl EditorPage {
                     // `target_cols` = 时间线像素宽，长视口下把基准层切片**合并到像素**
                     // （1 小时整片视图从 36,000 个 shape 降到 ≈ 1,000 个，绘制时间可控）。
                     let cols = (rect.width().ceil() as usize).clamp(1, 4096);
-                    let segs =
-                        edit::waveform::segments_for_view(base, &tiles_owned, t0, t1, cols);
-                    let drawn = paint_timeline_wave(
-                        painter,
-                        track,
-                        &segs.segs,
-                        segs.pending_ms,
-                        |t| x_of(t, px, vs),
-                    );
+                    let segs = edit::waveform::segments_for_view(base, &tiles_owned, t0, t1, cols);
+                    let drawn =
+                        paint_timeline_wave(painter, track, &segs.segs, segs.pending_ms, |t| {
+                            x_of(t, px, vs)
+                        });
                     // 非测试构建也要"读"一下结果，否则这个结构体就是 dead_code。
                     let _ = drawn.drew_anything();
                     // **首屏可见耗时**（P22 验收要贴的那个数字）：第一帧真的画出波形段的时刻
@@ -5582,7 +5676,6 @@ impl EditorPage {
             // 那种写法会让 L0 在算的整段时间里每帧都排下一帧，等于持续满帧重绘。
             // 现在 L0 每发一档进度、细化每产出一块瓦片都会从后台线程
             // `request_repaint()` 一次（数据驱动，见 `wake_ui`）。
-
 
             // ---- **胶片条（P19/P21/P24/P25）**：完整显示 + 可见区间里固定 5 个（放不下才减） ----
             //
@@ -5709,10 +5802,7 @@ impl EditorPage {
                     continue;
                 }
                 painter.line_segment(
-                    [
-                        egui::pos2(x, track.top()),
-                        egui::pos2(x, track.bottom()),
-                    ],
+                    [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
                     egui::Stroke::new(1.5, theme::accent()),
                 );
                 painter.circle_filled(egui::pos2(x, track.top() + 3.0), 2.5, theme::accent());
@@ -5797,10 +5887,17 @@ impl EditorPage {
                         continue;
                     }
                     painter.line_segment(
-                        [egui::pos2(x, rect.top() + 15.0), egui::pos2(x, track.bottom())],
+                        [
+                            egui::pos2(x, rect.top() + 15.0),
+                            egui::pos2(x, track.bottom()),
+                        ],
                         egui::Stroke::new(1.5, seg_inactive_edge()),
                     );
-                    painter.circle_filled(egui::pos2(x, track.top() + 2.0), 3.0, seg_inactive_edge());
+                    painter.circle_filled(
+                        egui::pos2(x, track.top() + 2.0),
+                        3.0,
+                        seg_inactive_edge(),
+                    );
                 }
             }
 
@@ -5811,7 +5908,10 @@ impl EditorPage {
             ] {
                 if x >= rect.left() - 1.0 && x <= rect.right() + 1.0 {
                     painter.line_segment(
-                        [egui::pos2(x, rect.top() + 15.0), egui::pos2(x, track.bottom())],
+                        [
+                            egui::pos2(x, rect.top() + 15.0),
+                            egui::pos2(x, track.bottom()),
+                        ],
                         egui::Stroke::new(2.0, color),
                     );
                     // 把手画在轨道顶端：既能看清是哪根标尺，也不挡时间尺刻度
@@ -5972,8 +6072,7 @@ impl EditorPage {
                 // 但取整/异常比例下也不会拉伸（这条路径由 `fit_thumb_size` 的单测保证）。
                 let fit = fit_thumb_size(w, h, frame.width(), frame.height());
                 let img = egui::Rect::from_center_size(frame.center(), fit);
-                ui.painter()
-                    .image(tex, img, full_uv, egui::Color32::WHITE);
+                ui.painter().image(tex, img, full_uv, egui::Color32::WHITE);
                 // **P23 判据二**：首帧预览**已经渲染出一帧**（真的贴了一张已解码的纹理，
                 // 不是"数据在缓存里"、更不是下面那句"解码中…"的占位文字）。
                 painted_frame = true;
@@ -6352,7 +6451,11 @@ pub(crate) fn strip_layout(
         1.0
     };
     let left0 = if left0.is_finite() { left0 } else { 0.0 };
-    let right = if strip_right.is_finite() { strip_right } else { left0 };
+    let right = if strip_right.is_finite() {
+        strip_right
+    } else {
+        left0
+    };
     // 每个画面的实际宽度（非法值退化到 1，绝不产生负宽/NaN 宽）
     let w_of = |k: usize| -> f32 {
         let w = widths[k];
@@ -6526,14 +6629,8 @@ pub(crate) fn strip_fallback_probes(
     let last = last_ms.max(0);
     // ---- 边界 1/3：方向 + 视频流范围 + 最大距离 ----
     let (mut lo, mut hi) = match dir {
-        FallbackDir::Right => (
-            t_ms.saturating_add(1),
-            t_ms.saturating_add(dist).min(last),
-        ),
-        FallbackDir::Left => (
-            t_ms.saturating_sub(dist).max(0),
-            t_ms.saturating_sub(1),
-        ),
+        FallbackDir::Right => (t_ms.saturating_add(1), t_ms.saturating_add(dist).min(last)),
+        FallbackDir::Left => (t_ms.saturating_sub(dist).max(0), t_ms.saturating_sub(1)),
     };
     // ---- 边界 2：不得跨过相邻块的取样点 ----
     if let Some(nb) = neighbor_ms {
@@ -6615,12 +6712,7 @@ fn p27_log(phase: &'static str, warn: bool, line: String) {
     } else {
         tracing::info!(phase = phase, detail = %line, "P27");
     }
-    crate::ui::startup::mark_with(
-        phase,
-        "wave",
-        Some(std::time::Duration::ZERO),
-        Some(line),
-    );
+    crate::ui::startup::mark_with(phase, "wave", Some(std::time::Duration::ZERO), Some(line));
 }
 
 /// **P27 兜底链的来源**（只用于日志与单测断言；界面**不**因此打扰用户）。
@@ -6648,7 +6740,12 @@ impl FallbackSource {
 }
 
 /// **P27 ①：取样跨度那一行的内容**（纯函数，可单测 —— 日志内容本身也要有断言）。
-fn p27_sample_span_line(file: &str, span_end_ms: i64, from_video: bool, container_ms: i64) -> String {
+fn p27_sample_span_line(
+    file: &str,
+    span_end_ms: i64,
+    from_video: bool,
+    container_ms: i64,
+) -> String {
     format!(
         "file={file} span_end_ms={span_end_ms} container_dur_ms={container_ms} \
          eps_ms={P27_SAMPLE_EPS_MS} source={}",
@@ -6696,12 +6793,8 @@ fn nearest_strip_thumb(prev: &[Thumb], idx: Option<usize>) -> Option<&Thumb> {
     let Some(i) = idx else {
         return prev.get(prev.len() / 2);
     };
-    prev.iter().min_by_key(|t| {
-        (
-            (t.idx as i64 - i as i64).unsigned_abs(),
-            t.idx,
-        )
-    })
+    prev.iter()
+        .min_by_key(|t| ((t.idx as i64 - i as i64).unsigned_abs(), t.idx))
 }
 
 /// **胶片条的解码键**：把取样时刻**量化**到 `STRIP_QUANT_MS` 网格（缓存跨缩放复用的关键）。
@@ -7074,7 +7167,10 @@ fn paint_bad_ranges(
             continue; // 只画可见区间
         }
         painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(left, band.top()), egui::pos2(right, band.bottom())),
+            egui::Rect::from_min_max(
+                egui::pos2(left, band.top()),
+                egui::pos2(right, band.bottom()),
+            ),
             1.0,
             if b.kind.is_hard() {
                 bad_hard_color()
@@ -7143,10 +7239,17 @@ fn paint_timeline_wave(
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x0, y_top.min(y_bot)),
-                egui::pos2(x0 + w.max(1.0), y_top.max(y_bot).max(y_top.min(y_bot) + 2.0)),
+                egui::pos2(
+                    x0 + w.max(1.0),
+                    y_top.max(y_bot).max(y_top.min(y_bot) + 2.0),
+                ),
             ),
             0.0,
-            if s.detail { wave_color() } else { wave_pending() },
+            if s.detail {
+                wave_color()
+            } else {
+                wave_pending()
+            },
         );
         if first.is_nan() {
             first = x0;
@@ -7167,7 +7270,10 @@ fn paint_timeline_wave(
         let cut_x = x_of(cut_ms as f64);
         if cut_x.is_finite() && cut_x <= track.right() + 1.0 {
             painter.line_segment(
-                [egui::pos2(cut_x, lane.top()), egui::pos2(cut_x, lane.bottom())],
+                [
+                    egui::pos2(cut_x, lane.top()),
+                    egui::pos2(cut_x, lane.bottom()),
+                ],
                 egui::Stroke::new(1.0, wave_pending()),
             );
         }
@@ -7230,7 +7336,12 @@ fn thumb_keyframe(clip: &Clip, at_ms: i64) -> Option<i64> {
     match nearest {
         Some(k) if decodable(k) => Some(k),
         // 最近的那个越界了 → 退回"末端之前最后一个可解的关键帧"（有界：只查已扫到的那张表）
-        _ => clip.keyframes_ms.iter().rev().copied().find(|k| decodable(*k)),
+        _ => clip
+            .keyframes_ms
+            .iter()
+            .rev()
+            .copied()
+            .find(|k| decodable(*k)),
     }
 }
 
@@ -8226,12 +8337,7 @@ mod tests {
             wide.probe.content_h
         );
         for lang in ["zh-CN", "en-US"] {
-            let m = measure_editor_with(
-                synthetic_clip_169(),
-                MIN_INNER_W,
-                page_avail_at_min,
-                lang,
-            );
+            let m = measure_editor_with(synthetic_clip_169(), MIN_INNER_W, page_avail_at_min, lang);
             assert!(
                 m.probe.no_vertical_scroll(),
                 "[{lang}] 最小窗口下剪辑页内容不得溢出滚动区：内容 {:.1} > 视口 {:.1}",
@@ -8366,9 +8472,7 @@ mod tests {
                 lang,
                 &segs,
             );
-            let label = m
-                .seg_label
-                .expect("有片段时必须画出「片段列表」标签");
+            let label = m.seg_label.expect("有片段时必须画出「片段列表」标签");
             assert_eq!(m.seg_chips.len(), segs.len(), "[{lang}] 芯片数不对");
             // ① 标签在第一个芯片左边；② 同一行（标签垂直中心落在第一个芯片的上下缘之间）
             let first = m.seg_chips[0];
@@ -8424,7 +8528,10 @@ mod tests {
         let shapes = h.frame_capture(vec![]);
         let t = &h.page.test_rects;
         // 中性底（全部来自主题的控件样式，不是语义色）：静息白底 / 悬停浅灰
-        let neutral = [crate::ui::theme::card_fill(), egui::Color32::from_rgb(0xF2, 0xF4, 0xF7)];
+        let neutral = [
+            crate::ui::theme::card_fill(),
+            egui::Color32::from_rgb(0xF2, 0xF4, 0xF7),
+        ];
         let semantic = [
             crate::ui::theme::ok_fg(),
             crate::ui::theme::ok_solid(),
@@ -8582,7 +8689,9 @@ mod tests {
             "片段为空时不应再画计数"
         );
         assert!(
-            !texts.iter().any(|(s, _)| s.contains("拖拽可以改变片段顺序")),
+            !texts
+                .iter()
+                .any(|(s, _)| s.contains("拖拽可以改变片段顺序")),
             "片段为空时提示应一起消失（与计数器同一个条件块）"
         );
     }
@@ -8666,7 +8775,12 @@ mod tests {
         }
         // 画在深色轨道上的内容必须**提亮**：这几个在浅色下是"中深色压浅灰底"，
         // 深色下若沿用原值等于看不见。
-        for name in ["wave_color", "bad_hard_color", "bad_soft_color", "seg_number_color"] {
+        for name in [
+            "wave_color",
+            "bad_hard_color",
+            "bad_soft_color",
+            "seg_number_color",
+        ] {
             let i = names.iter().position(|n| *n == name).unwrap();
             assert!(
                 lum(dark[i]) > lum(light[i]),
@@ -8681,10 +8795,7 @@ mod tests {
 
     /// 预览画框（本帧真实渲染出来的）
     fn preview_rect(h: &Harness) -> egui::Rect {
-        h.page
-            .test_rects
-            .preview_frame
-            .expect("本帧应画出预览画框")
+        h.page.test_rects.preview_frame.expect("本帧应画出预览画框")
     }
 
     /// 比例断言：实测比例与源比例相差不超过 `tol`（相对误差）
@@ -8710,7 +8821,11 @@ mod tests {
     fn headless_fluid_preview_follows_window_height() {
         let mut heights = Vec::new();
         for (w, h) in [(1400.0f32, 600.0f32), (1600.0, 900.0), (1800.0, 1400.0)] {
-            let mut hh = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0), w, h);
+            let mut hh = Harness::with_screen(
+                synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0),
+                w,
+                h,
+            );
             for _ in 0..2 {
                 hh.frame(vec![]);
             }
@@ -8744,7 +8859,11 @@ mod tests {
     /// 比例照旧；同时底部两行仍然完整可见（不会被裁掉）。
     #[test]
     fn headless_preview_respects_the_200px_floor() {
-        let mut hh = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0), 1024.0, 400.0);
+        let mut hh = Harness::with_screen(
+            synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0),
+            1024.0,
+            400.0,
+        );
         for _ in 0..2 {
             hh.frame(vec![]);
         }
@@ -8758,7 +8877,10 @@ mod tests {
         assert_aspect(rect, SYNTH_ASPECT, 0.01, "高度下限");
         // 底部两行仍然在页面里（面板先占高度，所以矮窗口也不会把它们挤没）
         let help = hh.page.test_rects.help.expect("操作指南行始终渲染");
-        assert!(help.top() < 400.0 && help.height() > 0.0, "操作指南行应完整可见");
+        assert!(
+            help.top() < 400.0 && help.height() > 0.0,
+            "操作指南行应完整可见"
+        );
     }
 
     /// **宽度受限时按宽度收敛**：窗口很宽但很矮（可用高度 659）→ 预览先按宽度收敛，
@@ -8766,7 +8888,11 @@ mod tests {
     #[test]
     fn headless_preview_converges_on_width_when_needed() {
         for h in [900.0f32, 1400.0] {
-            let mut hh = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0), 1024.0, h);
+            let mut hh = Harness::with_screen(
+                synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0),
+                1024.0,
+                h,
+            );
             for _ in 0..2 {
                 hh.frame(vec![]);
             }
@@ -8792,11 +8918,19 @@ mod tests {
     #[test]
     fn fluid_preview_size_rules() {
         let aspect = SYNTH_ASPECT; // 4:3
-        // ① 可用高度 120（< 200）→ 高度取下限 200，宽度由比例推出（允许横向裁切）
+                                   // ① 可用高度 120（< 200）→ 高度取下限 200，宽度由比例推出（允许横向裁切）
         let s = fluid_preview_size(120.0, 1000.0, aspect, PREVIEW_MIN_H);
         assert_eq!(s.y, PREVIEW_MIN_H, "可用高度 120 → 预览高取 200");
-        assert!((s.x - PREVIEW_MIN_H * aspect).abs() <= 1.0, "宽度按比例推出：{s:?}");
-        assert_aspect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s), aspect, 0.01, "下限");
+        assert!(
+            (s.x - PREVIEW_MIN_H * aspect).abs() <= 1.0,
+            "宽度按比例推出：{s:?}"
+        );
+        assert_aspect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s),
+            aspect,
+            0.01,
+            "下限",
+        );
 
         // ② 高度为准：够高就用满，宽度 = 高 × 比例
         let s = fluid_preview_size(600.0, 5000.0, aspect, PREVIEW_MIN_H);
@@ -8805,7 +8939,12 @@ mod tests {
         // ③ 宽度受限：收到 804 宽 → 高 = 804 / (4/3) = 603 ≥ 200 → 接受收敛
         let s = fluid_preview_size(1159.0, 804.0, aspect, PREVIEW_MIN_H);
         assert_eq!((s.x, s.y), (804.0, 603.0));
-        assert_aspect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s), aspect, 0.01, "宽收敛");
+        assert_aspect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s),
+            aspect,
+            0.01,
+            "宽收敛",
+        );
 
         // ④ 宽度收敛会把高度压到**下限以下** → **保高度下限**（宽度允许超出可用宽度）。
         //    注意口径：这里的"保下限"是指高度**不被宽度收敛带走**（仍取 max(可用高度, 200)），
@@ -8813,14 +8952,27 @@ mod tests {
         let s = fluid_preview_size(120.0, 240.0, aspect, PREVIEW_MIN_H); // 240/(4/3) = 180 < 200
         assert_eq!(s.y, PREVIEW_MIN_H);
         assert_eq!(s.x, 267.0, "宽度由高度下限推出");
-        assert!(s.x > 240.0, "此时宽度允许超出可用宽度（横向裁切/滚动）：{s:?}");
-        assert_aspect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s), aspect, 0.01, "保下限");
+        assert!(
+            s.x > 240.0,
+            "此时宽度允许超出可用宽度（横向裁切/滚动）：{s:?}"
+        );
+        assert_aspect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s),
+            aspect,
+            0.01,
+            "保下限",
+        );
 
         // ⑤ 可用高度很高但可用宽度很窄：**保持高度为准**（不因为宽度受限就把高度砍到 200）
         let s = fluid_preview_size(1000.0, 240.0, aspect, PREVIEW_MIN_H);
         assert_eq!(s.y, 1000.0, "高度仍以可用高度为准");
         assert!(s.x > 240.0, "宽度超出可用宽度（横向裁切/滚动）：{s:?}");
-        assert_aspect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s), aspect, 0.01, "高宽冲突");
+        assert_aspect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), s),
+            aspect,
+            0.01,
+            "高宽冲突",
+        );
         // 16:9 同理
         let s = fluid_preview_size(1000.0, 300.0, 16.0 / 9.0, PREVIEW_MIN_H);
         assert_eq!(s.y, 1000.0, "300/(16/9)=168.75 < 200 → 不收敛，保高度");
@@ -8833,7 +8985,10 @@ mod tests {
             (f32::NEG_INFINITY, 0.0, 0.0),
         ] {
             let s = fluid_preview_size(avail, max_w, asp, PREVIEW_MIN_H);
-            assert!(s.x.is_finite() && s.y.is_finite() && s.x > 0.0 && s.y > 0.0, "{s:?}");
+            assert!(
+                s.x.is_finite() && s.y.is_finite() && s.x > 0.0 && s.y > 0.0,
+                "{s:?}"
+            );
             assert!(s.y >= PREVIEW_MIN_H);
         }
     }
@@ -8880,7 +9035,11 @@ mod tests {
         assert_eq!((w, h), (640, 360));
         let (w, h) = decode_size(640, 4.0 / 3.0);
         assert_eq!((w, h), (640, 480));
-        assert_eq!(decode_size(0, 4.0 / 3.0).1, 1, "0 尺寸也不产生 0（egui 会画出畸形矩形）");
+        assert_eq!(
+            decode_size(0, 4.0 / 3.0).1,
+            1,
+            "0 尺寸也不产生 0（egui 会画出畸形矩形）"
+        );
     }
 
     /// **拖动窗口 1px 不重新解码**（页面级）：解码档位不变 → 缓存命中 → 不排新任务。
@@ -8942,7 +9101,11 @@ mod tests {
     #[test]
     fn headless_file_info_and_help_are_adjacent_below_the_preview() {
         for (w, h) in [(1040.0f32, 740.0f32), (1024.0, 1400.0), (1024.0, 400.0)] {
-            let mut hh = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0), w, h);
+            let mut hh = Harness::with_screen(
+                synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0),
+                w,
+                h,
+            );
             for _ in 0..2 {
                 hh.frame(vec![]);
             }
@@ -9004,7 +9167,11 @@ mod tests {
             (600.0, 1400.0),
             (420.0, 900.0), // 极窄：按钮换行到预览下方
         ] {
-            let mut hh = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0), w, h);
+            let mut hh = Harness::with_screen(
+                synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0),
+                w,
+                h,
+            );
             for _ in 0..2 {
                 hh.frame(vec![]);
             }
@@ -9017,9 +9184,15 @@ mod tests {
                 btn.left() >= -0.5 && btn.right() <= w + 0.5,
                 "窗口 {w}×{h}：导出按钮 {btn:?} 被挤出视野（页面宽 {w}）"
             );
-            assert_eq!((btn.width(), btn.height()), (EXPORT_BTN_W, crate::ui::theme::H_PRIMARY));
+            assert_eq!(
+                (btn.width(), btn.height()),
+                (EXPORT_BTN_W, crate::ui::theme::H_PRIMARY)
+            );
             // **用户口径的版式**：时间码 → 播放（绿）→ 导出，自上而下，宽度一致、左边界对齐
-            assert_eq!((play.width(), play.height()), (EXPORT_BTN_W, crate::ui::theme::H_PRIMARY));
+            assert_eq!(
+                (play.width(), play.height()),
+                (EXPORT_BTN_W, crate::ui::theme::H_PRIMARY)
+            );
             assert!(
                 (play.left() - btn.left()).abs() < 0.5 && (code.left() - btn.left()).abs() < 0.5,
                 "时间码/播放/导出必须左边界对齐（{:.1} / {:.1} / {:.1}）",
@@ -9042,7 +9215,10 @@ mod tests {
             if btn.top() >= preview.bottom() {
                 // 换行：整列在预览（含时间码）下方
                 assert!(btn.top() > preview.bottom(), "窄窗口时整列应在预览下方");
-                assert!(code.top() > preview.bottom(), "窄窗口时时间码也应在预览下方");
+                assert!(
+                    code.top() > preview.bottom(),
+                    "窄窗口时时间码也应在预览下方"
+                );
             } else {
                 // 常态：整列在预览右侧，且**整列**与预览垂直居中（±1px）
                 assert!(
@@ -9053,10 +9229,7 @@ mod tests {
                 );
                 let col_cy = (code.top() + btn.bottom()) / 2.0;
                 let dy = (col_cy - preview.center().y).abs();
-                assert!(
-                    dy <= 1.0,
-                    "按钮列应与预览垂直居中（误差 {dy:.1}px）"
-                );
+                assert!(dy <= 1.0, "按钮列应与预览垂直居中（误差 {dy:.1}px）");
             }
         }
     }
@@ -9158,12 +9331,7 @@ mod tests {
         let mut hh = Harness::new(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0));
         hh.frame(vec![]);
         // 把视口调到"正好看到 2000 ms"（不铺满，才有翻页可言）
-        let tw = hh
-            .page
-            .test_rects
-            .timeline
-            .expect("应画出时间线")
-            .width() as f64;
+        let tw = hh.page.test_rects.timeline.expect("应画出时间线").width() as f64;
         hh.page.px_per_ms = tw / 2_000.0;
         hh.page.fit_mode = false;
         hh.page.view_start_ms = 0.0;
@@ -9222,7 +9390,11 @@ mod tests {
     /// （用户实机报的正是"色带朝反方向跑"）。
     #[test]
     fn dragging_the_pos_row_scrolls_the_view_without_moving_the_current_frame() {
-        let mut hh = Harness::new(synthetic_clip(60_000, vec![0, 10_000, 20_000, 30_000], 30.0));
+        let mut hh = Harness::new(synthetic_clip(
+            60_000,
+            vec![0, 10_000, 20_000, 30_000],
+            30.0,
+        ));
         hh.frame(vec![]);
         // 放大 10 倍：可见时长只剩 6 s，才有可滚的余量
         hh.page.fit_mode = false;
@@ -9277,7 +9449,11 @@ mod tests {
     /// 标尺停在停播那一刻。
     #[test]
     fn dragging_the_pos_row_stops_playback() {
-        let mut hh = Harness::new(synthetic_clip(60_000, vec![0, 10_000, 20_000, 30_000], 30.0));
+        let mut hh = Harness::new(synthetic_clip(
+            60_000,
+            vec![0, 10_000, 20_000, 30_000],
+            30.0,
+        ));
         hh.frame(vec![]);
         // 放大 10 倍：位置行才有可滚的余量（铺满时"碰它"不算改视图，不停播）
         hh.page.fit_mode = false;
@@ -9301,7 +9477,11 @@ mod tests {
     /// **点一下滚动条同样停播**（同一条口径：动视口 = 停播）。
     #[test]
     fn clicking_the_pos_row_stops_playback() {
-        let mut hh = Harness::new(synthetic_clip(60_000, vec![0, 10_000, 20_000, 30_000], 30.0));
+        let mut hh = Harness::new(synthetic_clip(
+            60_000,
+            vec![0, 10_000, 20_000, 30_000],
+            30.0,
+        ));
         hh.frame(vec![]);
         hh.page.fit_mode = false;
         hh.page.px_per_ms = fit_px_per_ms(1024.0, 60_000) * 10.0;
@@ -9393,7 +9573,11 @@ mod tests {
         let clip = synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0);
         let mut hh = Harness::with_screen(clip.clone(), 1400.0, 600.0);
         hh.frame(vec![]);
-        assert_eq!(hh.page.preview_ms(), Some(4_000), "标尺 5000 → 最近关键帧 4000");
+        assert_eq!(
+            hh.page.preview_ms(),
+            Some(4_000),
+            "标尺 5000 → 最近关键帧 4000"
+        );
         let first = preview_rect(&hh);
         hh.screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
         hh.frame(vec![]);
@@ -9402,9 +9586,11 @@ mod tests {
             Some(4_000),
             "窗口变高只改尺寸，不改「显示哪一帧」"
         );
-        assert!(preview_rect(&hh).height() > first.height(), "尺寸确实跟着变大了");
+        assert!(
+            preview_rect(&hh).height() > first.height(),
+            "尺寸确实跟着变大了"
+        );
     }
-
 
     /// **用户最终语义**：预览 = **蓝色当前标尺所在位置最近的关键帧**。
     ///
@@ -9683,10 +9869,8 @@ mod tests {
                 ..Config::default()
             });
             page.clip = Some(synthetic_clip_169());
-            let screen = egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(MIN_INNER_W, 768.0),
-            );
+            let screen =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(MIN_INNER_W, 768.0));
             for _ in 0..2 {
                 let input = egui::RawInput {
                     screen_rect: Some(screen),
@@ -9710,13 +9894,10 @@ mod tests {
                 ctx.run_ui(input, |ui| {
                     let font = egui::FontId::proportional(crate::ui::theme::FS_SMALL);
                     let painter = ui.painter();
-                    let g = painter.layout_no_wrap(t.clone(), font.clone(), crate::ui::theme::faint());
-                    let wrapped = painter.layout(
-                        t.clone(),
-                        font.clone(),
-                        crate::ui::theme::faint(),
-                        avail,
-                    );
+                    let g =
+                        painter.layout_no_wrap(t.clone(), font.clone(), crate::ui::theme::faint());
+                    let wrapped =
+                        painter.layout(t.clone(), font.clone(), crate::ui::theme::faint(), avail);
                     out = (g.size().x, wrapped.size().y, g.size().y, g.size().y);
                 })
                 .drop_without_applying_deltas();
@@ -9829,7 +10010,8 @@ mod tests {
     #[test]
     fn p14_pos_row_sits_below_the_ruler_and_matches_its_width() {
         for w in [760.0f32, 1024.0, 1600.0] {
-            let mut h = Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000], 30.0), w, 768.0);
+            let mut h =
+                Harness::with_screen(synthetic_clip(10_000, vec![0, 2000, 4000], 30.0), w, 768.0);
             h.frame(vec![]);
             let t = &h.page.test_rects;
             let ruler = t.ruler.expect("应登记刻度尺区域");
@@ -9849,7 +10031,8 @@ mod tests {
                 ruler.width()
             );
             assert!(
-                (pos.left() - ruler.left()).abs() <= 0.5 && (pos.right() - ruler.right()).abs() <= 0.5,
+                (pos.left() - ruler.left()).abs() <= 0.5
+                    && (pos.right() - ruler.right()).abs() <= 0.5,
                 "宽 {w}：位置行左右边界必须与时间码行**对齐**"
             );
             assert!(
@@ -9911,8 +10094,8 @@ mod tests {
         let mut white_boxes_in_row = 0usize;
         for s in &shapes {
             if let egui::Shape::Rect(r) = s {
-                let touches_row = r.rect.center().y >= pos.top() - 1.0
-                    && r.rect.center().y <= pos.bottom() + 1.0;
+                let touches_row =
+                    r.rect.center().y >= pos.top() - 1.0 && r.rect.center().y <= pos.bottom() + 1.0;
                 let looks_like_the_old_block = r.fill == egui::Color32::WHITE
                     && r.stroke.width > 0.0
                     && r.rect.height() <= 14.0;
@@ -10021,7 +10204,11 @@ mod tests {
     /// （口径同 `p15_tile_wakes_the_ui_once_without_a_heartbeat`：静置时必须静止，**不新增心跳**）。
     #[test]
     fn p30_dragging_the_scrollbar_does_not_self_excite_repaints() {
-        let mut h = Harness::new(synthetic_clip(60_000, vec![0, 10_000, 20_000, 30_000], 30.0));
+        let mut h = Harness::new(synthetic_clip(
+            60_000,
+            vec![0, 10_000, 20_000, 30_000],
+            30.0,
+        ));
         h.frame(vec![]);
         // 放大 10 倍：滚动才有"可移动的余量"
         h.page.fit_mode = false;
@@ -10097,7 +10284,11 @@ mod tests {
     /// * **当前帧一动不动**（这是 P30 的核心口径）。
     #[test]
     fn p30_clicking_the_scrollbar_centers_the_clicked_time() {
-        let mut h = Harness::new(synthetic_clip(60_000, vec![0, 10_000, 20_000, 30_000], 30.0));
+        let mut h = Harness::new(synthetic_clip(
+            60_000,
+            vec![0, 10_000, 20_000, 30_000],
+            30.0,
+        ));
         h.frame(vec![]);
         // 放大 10 倍：可见时长只剩全片的 1/10（6 s）
         h.page.fit_mode = false;
@@ -10135,7 +10326,10 @@ mod tests {
 
         // ② 片头夹取：点到片头 → 视口贴住 0，绝不出现负的 view_start
         h.click(h.pos_at(0.0, pos));
-        assert_eq!(h.page.view_start_ms, 0.0, "片头必须把视口夹在 0（不得 < 0）");
+        assert_eq!(
+            h.page.view_start_ms, 0.0,
+            "片头必须把视口夹在 0（不得 < 0）"
+        );
         assert_eq!(h.page.cursor_ms, cur, "点滚动条**不得**改变当前帧");
 
         // ③ 远离片尾时**始终**居中：54 s（90%）处视口右端还在片内
@@ -10180,7 +10374,8 @@ mod tests {
 
     /// 悬停（只移动指针）**绝不**改变起点/终点；点击时间线也只改当前标尺。
     #[test]
-    fn headless_hover_never_touches_selection() {        let mut h = Harness::new(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0));
+    fn headless_hover_never_touches_selection() {
+        let mut h = Harness::new(synthetic_clip(10_000, vec![0, 2000, 4000, 6000], 30.0));
         h.frame(vec![]);
         h.page.sel_start_ms = 1_000;
         h.page.sel_end_ms = 9_000;
@@ -10298,19 +10493,43 @@ mod tests {
         assert_eq!(nudge_cursor_ms(&clip, 1_000, 1, none), 1_033);
         assert_eq!(nudge_cursor_ms(&clip, 1_033, -1, none), 1_000);
         // Ctrl（Mac 上是 Cmd）→ 10 ms
-        assert_eq!(nudge_cursor_ms(&clip, 1_000, 1, egui::Modifiers::CTRL), 1_010);
-        assert_eq!(nudge_cursor_ms(&clip, 1_000, -1, egui::Modifiers::CTRL), 990);
-        assert_eq!(nudge_cursor_ms(&clip, 1_000, 1, egui::Modifiers::COMMAND), 1_010);
+        assert_eq!(
+            nudge_cursor_ms(&clip, 1_000, 1, egui::Modifiers::CTRL),
+            1_010
+        );
+        assert_eq!(
+            nudge_cursor_ms(&clip, 1_000, -1, egui::Modifiers::CTRL),
+            990
+        );
+        assert_eq!(
+            nudge_cursor_ms(&clip, 1_000, 1, egui::Modifiers::COMMAND),
+            1_010
+        );
         // Shift → 前/后一个关键帧（严格大于/小于，正好落在关键帧上也不会原地不动）
-        assert_eq!(nudge_cursor_ms(&clip, 2_500, 1, egui::Modifiers::SHIFT), 4_000);
-        assert_eq!(nudge_cursor_ms(&clip, 2_500, -1, egui::Modifiers::SHIFT), 2_000);
-        assert_eq!(nudge_cursor_ms(&clip, 2_000, 1, egui::Modifiers::SHIFT), 4_000);
+        assert_eq!(
+            nudge_cursor_ms(&clip, 2_500, 1, egui::Modifiers::SHIFT),
+            4_000
+        );
+        assert_eq!(
+            nudge_cursor_ms(&clip, 2_500, -1, egui::Modifiers::SHIFT),
+            2_000
+        );
+        assert_eq!(
+            nudge_cursor_ms(&clip, 2_000, 1, egui::Modifiers::SHIFT),
+            4_000
+        );
         assert_eq!(nudge_cursor_ms(&clip, 2_000, -1, egui::Modifiers::SHIFT), 0);
         // 已经在头/尾 → 退回一帧；没有关键帧信息时也退回一帧
-        assert_eq!(nudge_cursor_ms(&clip, 6_000, 1, egui::Modifiers::SHIFT), 6_033);
+        assert_eq!(
+            nudge_cursor_ms(&clip, 6_000, 1, egui::Modifiers::SHIFT),
+            6_033
+        );
         assert_eq!(nudge_cursor_ms(&clip, 0, -1, egui::Modifiers::SHIFT), 0);
         let no_kf = synthetic_clip(10_000, vec![], 30.0);
-        assert_eq!(nudge_cursor_ms(&no_kf, 1_000, 1, egui::Modifiers::SHIFT), 1_033);
+        assert_eq!(
+            nudge_cursor_ms(&no_kf, 1_000, 1, egui::Modifiers::SHIFT),
+            1_033
+        );
         // 结果一律夹到 [0, duration]
         assert_eq!(nudge_cursor_ms(&clip, 10_000, 1, none), 10_000);
         assert_eq!(nudge_cursor_ms(&clip, 0, -1, none), 0);
@@ -10381,7 +10600,10 @@ mod tests {
             pick_recording_dir(None, None, Some(videos)),
             Some(videos.to_path_buf())
         );
-        assert_eq!(pick_recording_dir(Some(Path::new("")), None, Some(videos)), Some(videos.to_path_buf()));
+        assert_eq!(
+            pick_recording_dir(Some(Path::new("")), None, Some(videos)),
+            Some(videos.to_path_buf())
+        );
         // 4. 全都没有 → None（调用方据此不给对话框设起始目录）
         assert_eq!(pick_recording_dir(None, None, None), None);
         // 没有父目录的"最近视频"（例如盘符根）也要能安全跳过
@@ -10622,7 +10844,10 @@ mod tests {
         }
         // 合法输入下 factor = 1 应当基本不动（只受"下限夹取"影响）
         let (vs, px) = zoom_anchored(3_000.0, 0.05, 200.0, 800.0, 1.0, 60_000);
-        assert!((vs - 3_000.0).abs() < 1.0, "factor=1 时视图不该跳走（得到 {vs}）");
+        assert!(
+            (vs - 3_000.0).abs() < 1.0,
+            "factor=1 时视图不该跳走（得到 {vs}）"
+        );
         assert!((px - 0.05).abs() < 1e-12);
     }
 
@@ -10692,7 +10917,10 @@ mod tests {
     #[test]
     fn thumb_size_keeps_aspect() {
         let s = fit_thumb_size(320, 240, 134.0, 74.0);
-        assert!((s.x / s.y - 320.0 / 240.0).abs() < 1e-3, "4:3 不应被拉伸：{s:?}");
+        assert!(
+            (s.x / s.y - 320.0 / 240.0).abs() < 1e-3,
+            "4:3 不应被拉伸：{s:?}"
+        );
         assert!(s.x <= 134.0 && s.y <= 74.0);
         let s = fit_thumb_size(1920, 1080, 134.0, 74.0);
         assert!((s.x / s.y - 1920.0 / 1080.0).abs() < 1e-3);
@@ -10754,8 +10982,16 @@ mod tests {
         page.mark_end_at_cursor();
         assert_eq!(page.sel_start_ms, 3_400, "标记的是当前标尺");
         assert_eq!(page.sel_end_ms, 3_400);
-        assert_eq!(edit::snap_start(&clip, page.sel_start_ms), 4_000, "起点吸附到 ≥ 该点");
-        assert_eq!(edit::snap_end(&clip, page.sel_end_ms), 2_000, "终点吸附到 ≤ 该点");
+        assert_eq!(
+            edit::snap_start(&clip, page.sel_start_ms),
+            4_000,
+            "起点吸附到 ≥ 该点"
+        );
+        assert_eq!(
+            edit::snap_end(&clip, page.sel_end_ms),
+            2_000,
+            "终点吸附到 ≤ 该点"
+        );
         // 预览也只是标尺附近的关键帧，与标记互不影响
         assert_eq!(
             page.preview_ms(),
@@ -10787,7 +11023,11 @@ mod tests {
             ..Config::default()
         };
         let mut page = EditorPage::new(&cfg);
-        assert_eq!(page.loaded_path(), None, "新建且无 last_video_path 时不该有载入");
+        assert_eq!(
+            page.loaded_path(),
+            None,
+            "新建且无 last_video_path 时不该有载入"
+        );
         assert_eq!(page.loaded_duration_ms(), 0);
 
         page.open(&src);
@@ -10813,14 +11053,16 @@ mod tests {
         assert!(page.fit_mode, "open() 之后应回到整片铺满");
         assert!(page.kf_thumbs.is_empty());
         assert!(!page.hover_live, "新片子的第一帧不该认为指针在时间线上");
-        assert!(page.preview_ms().is_some(), "预览始终有值（等于标尺最近的关键帧）");
+        assert!(
+            page.preview_ms().is_some(),
+            "预览始终有值（等于标尺最近的关键帧）"
+        );
         assert_eq!(
             page.cursor_ms,
             page.loaded_duration_ms() / 2,
             "open() 之后当前标尺应重置到时长的一半（默认停在视频中间）"
         );
     }
-
 
     /// **P46**：`new(&Config)` **绝不自动载入**，哪怕 `last_video_path` 指向一个真实文件。
     ///
@@ -10896,7 +11138,10 @@ mod tests {
         // ③ 收消息（生产里由每帧 `poll_open` 做）→ 应用 → 扫描完成
         page.wait_open();
         assert!(page.clip.is_some(), "探测消息回来后应载入 clip");
-        assert!(page.open_pending_name.is_none(), "打开结束后不该还挂着「正在打开」");
+        assert!(
+            page.open_pending_name.is_none(),
+            "打开结束后不该还挂着「正在打开」"
+        );
         assert!(page.open_rx.is_none(), "终态之后通道要收掉");
         let c = page.clip.as_ref().expect("上面刚断言过");
         assert!(c.keyframes_scanned, "落定之后关键帧表必须是最终态");
@@ -11110,7 +11355,8 @@ mod tests {
     /// **P34 首帧优先**：关键帧表还没扫完时，预览**直接取目标时刻**（不解关键帧表）；
     /// 表定稿后回到旧语义（最近关键帧 / 没有关键帧就不请求）。
     #[test]
-    fn p34_thumb_keyframe_falls_back_to_raw_time_while_unscanned() {        // 未扫 + 空表（流式打开的第一段）：直接取目标时刻，首帧不必等扫描
+    fn p34_thumb_keyframe_falls_back_to_raw_time_while_unscanned() {
+        // 未扫 + 空表（流式打开的第一段）：直接取目标时刻，首帧不必等扫描
         let mut clip = synthetic_clip(10_000, vec![], 30.0);
         clip.keyframes_scanned = false;
         assert_eq!(thumb_keyframe(&clip, 4_321), Some(4_321));
@@ -11232,10 +11478,7 @@ mod tests {
     /// 为什么必须有它：卡死是"永远不返回"，直接跑会把整条测试进程挂住 ——
     /// 连"失败"都报不出来（P16 就是这么在测试里藏了很久）。
     /// 超时 = 断言失败；闭包里的 panic 照常穿出来（不吞、不误报成超时）。
-    fn with_watchdog<T: Send + 'static>(
-        secs: u64,
-        f: impl FnOnce() -> T + Send + 'static,
-    ) -> T {
+    fn with_watchdog<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
         type Panic = Box<dyn std::any::Any + Send>;
         let (tx, rx) = channel::<Result<T, Panic>>();
         std::thread::Builder::new()
@@ -11322,7 +11565,7 @@ mod tests {
                 "第一个文件的基准层应在预算内结束"
             );
             h.page.open(&b); // ← 修复前这里永久阻塞
-            // P34：打开异步化之后，先等这一轮打开落定再看 loaded_path
+                             // P34：打开异步化之后，先等这一轮打开落定再看 loaded_path
             h.page.wait_open();
             for _ in 0..20 {
                 h.frame();
@@ -11401,7 +11644,10 @@ mod tests {
                 ),
                 "L0 应在预算内结束"
             );
-            assert!(h.page.wave.job.is_some(), "L0 完成后任务本体必须还在（P15）");
+            assert!(
+                h.page.wave.job.is_some(),
+                "L0 完成后任务本体必须还在（P15）"
+            );
             assert!(h.page.wave.shared.is_some(), "L0 完成后 shared 必须还在");
             // 放大到"该用密集层"的档位（P18：档位由**可见时长**决定，`VISIBLE_BUCKETS` = 600）
             h.page.fit_mode = false;
@@ -11589,7 +11835,9 @@ mod tests {
             // 走一遍"绘制之后提交请求"的那一步（与 `timeline()` 里的调用完全同参）
             let a = h.page.view_start_ms;
             let b = (a + visible).min(h.duration_ms as f64);
-            h.page.wave.pump_refine(Some((a as i64, b as i64)), ((a + b) / 2.0) as i64);
+            h.page
+                .wave
+                .pump_refine(Some((a as i64, b as i64)), ((a + b) / 2.0) as i64);
             let tier = h.page.wave.last_refine_tier.expect("缩放后必须算出档位");
             assert_eq!(
                 tier,
@@ -11665,7 +11913,10 @@ mod tests {
     fn seed_l0(page: &mut EditorPage, duration_ms: i64) {
         let mut b = waveform::BaseLayer::empty(duration_ms.max(1));
         for i in 0..b.peaks.len() {
-            b.peaks[i] = waveform::Peak { min: -0.5, max: 0.5 };
+            b.peaks[i] = waveform::Peak {
+                min: -0.5,
+                max: 0.5,
+            };
             b.done[i] = true;
         }
         b.done_slices = b.peaks.len();
@@ -11734,7 +11985,10 @@ mod tests {
             );
         }
         for i in 1..widths.len() {
-            assert!(widths[i] < widths[i - 1], "每一步切片宽都必须更小：{widths:?}");
+            assert!(
+                widths[i] < widths[i - 1],
+                "每一步切片宽都必须更小：{widths:?}"
+            );
         }
         // 门槛上一档是 200 ms（= 120 s / 600），封顶是 1 ms
         assert_eq!(tiers, vec![200, 100, 25, 5, 1], "档位序列必须严格递减");
@@ -11794,7 +12048,8 @@ mod tests {
         set_visible_ms(&mut h, 60_000.0);
         h.page.wave.last_refine_at = None;
         h.frame(vec![]);
-        let after_zoom = h.page.wave.requested.len();        assert!(after_zoom > 0, "前提：这一次确实排过请求");
+        let after_zoom = h.page.wave.requested.len();
+        assert!(after_zoom > 0, "前提：这一次确实排过请求");
         // 平移（可见时长不变 → 档位不变）：只允许"新进入视野的片"被排一次
         h.page.view_start_ms = 30_000.0;
         h.page.wave.last_refine_at = None;
@@ -11817,7 +12072,10 @@ mod tests {
                 break;
             }
         }
-        assert!(settled, "缩放/平移停下后界面仍在请求重绘 —— 有自激 / 周期性心跳");
+        assert!(
+            settled,
+            "缩放/平移停下后界面仍在请求重绘 —— 有自激 / 周期性心跳"
+        );
         for i in 0..5 {
             h.frame(vec![]);
             assert!(
@@ -11846,7 +12104,10 @@ mod tests {
     /// 量一帧里**真正画出来**的胶片条块：块数与每块的 (宽, 高)。
     fn strip_tiles_of(h: &Harness) -> (usize, Vec<(f32, f32)>) {
         let rects = strip_rects_of(h);
-        (rects.len(), rects.iter().map(|r| (r.width(), r.height())).collect())
+        (
+            rects.len(),
+            rects.iter().map(|r| (r.width(), r.height())).collect(),
+        )
     }
 
     /// **P21 ①**：**3 个不同缩放级别**下，量真实绘制的画面矩形 → **宽高完全一致**
@@ -11862,7 +12123,7 @@ mod tests {
             768.0,
         );
         h.frame(vec![]); // 整片铺满（120 s）
-        // 合成素材是 320×240（4:3）→ 画面宽 = 行高 × 4/3
+                         // 合成素材是 320×240（4:3）→ 画面宽 = 行高 × 4/3
         let pic_w = strip_picture_width(strip_tile_height(), 320.0 / 240.0);
         let mut measured: Vec<(f64, usize, f32, f32)> = Vec::new();
         for vis in [120_000.0, 20_000.0, 4_000.0] {
@@ -11904,7 +12165,11 @@ mod tests {
         // 纯逻辑：画面宽 100、最小间隙 4（[`STRIP_MIN_GAP_PX`]）→ 每条线都正好卡在边界上
         let p = 100.0f32;
         assert_eq!(strip_slot_count(1000.0, p), 5);
-        assert_eq!(strip_slot_count(516.0, p), 5, "正好放下 5 个画面 + 4 个最小间隙");
+        assert_eq!(
+            strip_slot_count(516.0, p),
+            5,
+            "正好放下 5 个画面 + 4 个最小间隙"
+        );
         assert_eq!(strip_slot_count(515.9, p), 4, "差一点点就降到 4 个");
         assert_eq!(strip_slot_count(412.0, p), 4, "正好放下 4 个 + 3 个间隙");
         assert_eq!(strip_slot_count(411.9, p), 3);
@@ -11941,7 +12206,11 @@ mod tests {
                 rect.width()
             );
             assert_eq!(h.page.test_rects.strip_count, Some(expect));
-            assert_eq!(h.page.test_rects.strip_pic_w, Some(pic_w), "画面宽只有一个来源");
+            assert_eq!(
+                h.page.test_rects.strip_pic_w,
+                Some(pic_w),
+                "画面宽只有一个来源"
+            );
             // **窄条也要"首贴左、尾贴右"**（P25 明确：递减块数时这条不许破）
             let rects = strip_rects_of(&h);
             assert_eq!(rects.len(), expect);
@@ -12065,12 +12334,21 @@ mod tests {
                 assert!(gap >= -0.5, "可见 {vis} ms：间隙不能为负（实测 {gap:.2}）");
             }
             // 取样时刻随可见区间变化（不是固定网格）
-            let times = h.page.test_rects.strip_grid.clone().expect("应登记取样时刻");
+            let times = h
+                .page
+                .test_rects
+                .strip_grid
+                .clone()
+                .expect("应登记取样时刻");
             assert_eq!(times.len(), rects.len());
             assert_eq!(times[0], 0, "视口从 0 开始 → 第 1 个画面的时刻就是 0");
             // **P27 ①**：末端从"容器/素材时长"改成"**视频流时长 − ε**"（本合成素材两者相同）
             let expect_last = (vis as i64).min(p27_sample_last_ms(h.duration_ms));
-            assert_eq!(*times.last().unwrap(), expect_last, "最后一个画面的时刻 = 可见区间右端（夹到视频流 − ε）");
+            assert_eq!(
+                *times.last().unwrap(),
+                expect_last,
+                "最后一个画面的时刻 = 可见区间右端（夹到视频流 − ε）"
+            );
         }
     }
 
@@ -12103,7 +12381,10 @@ mod tests {
             assert_eq!(s.height, 52.0);
         }
         assert!((slots[0].left - left).abs() <= 0.01, "首贴左");
-        assert!((slots[4].left + slots[4].width - right).abs() <= 0.01, "尾贴右");
+        assert!(
+            (slots[4].left + slots[4].width - right).abs() <= 0.01,
+            "尾贴右"
+        );
         // 退化输入不 panic：空列表 / NaN / 右边界在左边界左边
         assert!(strip_layout(&[], &[], 52.0, 0.0, 100.0).is_empty());
         let bad = strip_layout(&[(0, 0.0), (1, 1.0)], &[50.0, 50.0], 52.0, f32::NAN, 10.0);
@@ -12112,7 +12393,10 @@ mod tests {
         // 装不下时（右边界在左边界左边 / 太窄）：间隙夹到 0，画面顺序不倒、位置不 NaN
         let narrow = strip_layout(&[(0, 0.0), (1, 1.0)], &[80.0, 80.0], 52.0, 0.0, 100.0);
         assert_eq!(narrow.len(), 2);
-        assert!(narrow[1].left >= narrow[0].left + narrow[0].width - 0.01, "画面不许重叠倒序");
+        assert!(
+            narrow[1].left >= narrow[0].left + narrow[0].width - 0.01,
+            "画面不许重叠倒序"
+        );
     }
 
     /// **P21 ④**：平移改变取样时刻（跟着可见区间走），块数不变；
@@ -12213,7 +12497,8 @@ mod tests {
         let h = &h.page;
         let issued = h.thumb_pending == Some((90_000, STRIP_TILE_W as u32))
             || h.strip_thumbs.contains_key(&want_key)
-            || h.thumb_failed.contains(&(want_key.time, want_key.w, want_key.h));
+            || h.thumb_failed
+                .contains(&(want_key.time, want_key.w, want_key.h));
         assert!(
             issued,
             "没缓存过的区间（90 s 起）必须重新请求缩略图；实测 pending={:?} strip_keys={} failed={}",
@@ -12311,7 +12596,9 @@ mod tests {
         h.page.wave.last_refine_at = None;
         let a = h.page.view_start_ms;
         let b = (a + 1024.0 / h.page.px_per_ms).min(h.duration_ms as f64);
-        h.page.wave.pump_refine(Some((a as i64, b as i64)), ((a + b) / 2.0) as i64);
+        h.page
+            .wave
+            .pump_refine(Some((a as i64, b as i64)), ((a + b) / 2.0) as i64);
         let sent_after_zoom = h.page.wave.requested.len();
         assert!(sent_after_zoom > 0, "前提：这一次确实排过请求");
         // egui 的"欠帧"要一两帧才排空（口径同 P15）：先允许它排空，但**必须停下来**
@@ -12323,10 +12610,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            settled,
-            "缩放停下后界面仍在请求重绘 —— 有自激 / 周期性心跳"
-        );
+        assert!(settled, "缩放停下后界面仍在请求重绘 —— 有自激 / 周期性心跳");
         // 排空之后再连跑 5 帧：一帧都不许再请求重绘，也不许再排新的细化请求
         for i in 0..5 {
             h.frame(vec![]);
@@ -12481,7 +12765,10 @@ mod tests {
         assert!(h.page.editor_import_ready, "预填的纹理应当让判据成立");
         let d = h.page.import_decision.expect("应记下判据");
         assert!(d.ready() && !d.fallback, "应当是判据成立而不是兜底：{d:?}");
-        assert!(d.video_info && d.preview && d.strip, "三条都要真的成立：{d:?}");
+        assert!(
+            d.video_info && d.preview && d.strip,
+            "三条都要真的成立：{d:?}"
+        );
         assert_eq!(
             h.page.wave.base_handles_count(),
             0,
@@ -12509,7 +12796,11 @@ mod tests {
             // 这一条走的是**真** `open()`（真解封装、真探测流信息；P34 起在后台线程做）
             page.open(&src);
             page.wait_open();
-            assert_eq!(page.loaded_path(), Some(src.as_path()), "open() 应载入该素材");
+            assert_eq!(
+                page.loaded_path(),
+                Some(src.as_path()),
+                "open() 应载入该素材"
+            );
             assert!(
                 page.import_started_at.is_some(),
                 "open() 之后应处在导入阶段（两阶段的第一阶段）"
@@ -12556,10 +12847,16 @@ mod tests {
             frame <= 2,
             "就绪条件第 1 帧就已画出来 → 最迟第 2 帧就该开始（实测第 {frame} 帧）"
         );
-        assert!(h.page.editor_import_ready && h.page.wave_phase_done, "两阶段应已落定");
+        assert!(
+            h.page.editor_import_ready && h.page.wave_phase_done,
+            "两阶段应已落定"
+        );
         let d = h.page.import_decision.expect("应记下判据");
         assert!(d.ready() && !d.fallback, "应当是判据成立而不是兜底：{d:?}");
-        assert!(d.video_info && d.preview && d.strip, "三条都要真的成立：{d:?}");
+        assert!(
+            d.video_info && d.preview && d.strip,
+            "三条都要真的成立：{d:?}"
+        );
         assert!(
             !h.page.wave_start_pending,
             "启动请求一旦兑现就应当清掉（不会每帧重来一次）"
@@ -12703,7 +13000,8 @@ mod tests {
     /// **P23 ④**：**没有视频流 → 不启动波形、不 panic**，并按既有降级路径收尾。
     #[test]
     fn p23_no_video_stream_does_not_start_waveform_and_does_not_panic() {
-        let mut h = Harness::with_screen(synthetic_clip(60_000, vec![0, 10_000], 30.0), 1024.0, 768.0);
+        let mut h =
+            Harness::with_screen(synthetic_clip(60_000, vec![0, 10_000], 30.0), 1024.0, 768.0);
         h.page.strip_requests_enabled = false;
         // 把 clip 换成"没有视频流"的那一种（模拟探测不到视频流）
         let mut clip = synthetic_clip(60_000, vec![], 30.0);
@@ -12863,7 +13161,10 @@ mod tests {
         for _ in 0..3 {
             h.frame(vec![]);
         }
-        assert!(h.page.editor_import_ready, "判据仍然会被评估（导入照常落定）");
+        assert!(
+            h.page.editor_import_ready,
+            "判据仍然会被评估（导入照常落定）"
+        );
         assert!(
             h.page.wave.opened_at.is_none() && h.page.wave.job.is_none(),
             "用户关着波形 → 就绪也不许启动（不白烧 CPU）"
@@ -12898,7 +13199,10 @@ mod tests {
             row_h, THUMB_BAND_H,
             "画面高必须严格等于胶片条行高（P24 用户口径：只适配高度）"
         );
-        assert_eq!(STRIP_TILE_W, 160.0, "160 只用于解码请求宽（P25：布局与它无关）");
+        assert_eq!(
+            STRIP_TILE_W, 160.0,
+            "160 只用于解码请求宽（P25：布局与它无关）"
+        );
         assert!(
             (pic_w - row_h * 4.0 / 3.0).abs() <= 0.01,
             "画面宽 = 行高 × 源宽高比（4:3 素材实测 {pic_w:.2}）"
@@ -12988,7 +13292,10 @@ mod tests {
             // 竖屏画面比横屏窄得多（这正是"完整显示"的直接后果）
             let portrait_w = strip_picture_width(row_h, 1080.0 / 1920.0);
             let landscape_w = strip_picture_width(row_h, 1920.0 / 1080.0);
-            assert!(portrait_w < 32.0 && landscape_w > 90.0, "竖屏 ≈29px、16:9 ≈92px");
+            assert!(
+                portrait_w < 32.0 && landscape_w > 90.0,
+                "竖屏 ≈29px、16:9 ≈92px"
+            );
         }
     }
 
@@ -13047,7 +13354,10 @@ mod tests {
         // （换文件时 `open()` 会整表清空，见那里的注释）。
         let portrait = strip_picture_width(h52, 1080.0 / 1920.0);
         let landscape = strip_picture_width(h52, 1920.0 / 1080.0);
-        assert!(portrait < landscape, "源宽高比不同 → 画面宽不同（{portrait} vs {landscape}）");
+        assert!(
+            portrait < landscape,
+            "源宽高比不同 → 画面宽不同（{portrait} vs {landscape}）"
+        );
         // 非法输入不 panic、不产生畸形宽
         assert!(strip_picture_width(f32::NAN, 1.7778) > 0.0);
         assert!(strip_picture_width(52.0, f32::NAN) > 0.0);
@@ -13080,7 +13390,11 @@ mod tests {
         h.page.strip_thumbs.clear();
         for (t, _) in &samples {
             let key = strip_thumb_key(*t, 60_000, STRIP_TILE_W as u32, other_h);
-            assert_ne!(key.h, strip_h_key(strip_tile_height()), "前提：确实是另一个高度档");
+            assert_ne!(
+                key.h,
+                strip_h_key(strip_tile_height()),
+                "前提：确实是另一个高度档"
+            );
             let img = egui::ColorImage::from_rgba_unmultiplied([2, 2], &[0x11u8; 16]);
             let tex = h
                 .ctx
@@ -13095,7 +13409,11 @@ mod tests {
             "只有「别的高度档」的缓存时，本帧必须一块都画不出来（高度不许串）"
         );
         assert!(
-            h.page.test_rects.strip_tiles.as_ref().is_some_and(|v| v.is_empty()),
+            h.page
+                .test_rects
+                .strip_tiles
+                .as_ref()
+                .is_some_and(|v| v.is_empty()),
             "`strip_tiles` 应当如实登记「这一帧一块都没画」"
         );
         // 把当前档补回来 → 立刻又能画，且矩形高 = 行高
@@ -13157,7 +13475,10 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 0.0)),
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 0.0)),
         );
-        assert!(bad.width() > 0.0 && bad.height() > 0.0, "退化输入也不产生畸形 uv");
+        assert!(
+            bad.width() > 0.0 && bad.height() > 0.0,
+            "退化输入也不产生畸形 uv"
+        );
     }
 
     // =======================================================================
@@ -13329,7 +13650,12 @@ mod tests {
         // ---- 界面侧：整片铺满时，5 个取样时刻一个都不许越出视频流 ----
         let mut h = Harness::with_screen(synthetic_clip_split(120_000, 6_000), 1024.0, 768.0);
         h.frame(vec![]);
-        let times = h.page.test_rects.strip_grid.clone().expect("应登记取样时刻");
+        let times = h
+            .page
+            .test_rects
+            .strip_grid
+            .clone()
+            .expect("应登记取样时刻");
         assert_eq!(times.len(), 5);
         assert!(
             times.iter().all(|t| *t <= last),
@@ -13341,9 +13667,8 @@ mod tests {
     /// **P27 ②：方向规则**（用户口径：5 块时前 3 向右 / 后 2 向左，n<5 按同一精神推广）。
     #[test]
     fn p27_fallback_direction_rule_matches_the_user_table() {
-        let dirs = |n: usize| -> Vec<FallbackDir> {
-            (0..n).map(|k| strip_fallback_dir(k, n)).collect()
-        };
+        let dirs =
+            |n: usize| -> Vec<FallbackDir> { (0..n).map(|k| strip_fallback_dir(k, n)).collect() };
         assert_eq!(
             dirs(5),
             vec![
@@ -13386,7 +13711,7 @@ mod tests {
     fn p27_direction_search_is_bounded_and_never_crosses_neighbours() {
         let kf = vec![0i64, 1_000, 2_000, 3_000, 4_000, 5_000];
         let last = 5_900; // 视频流 6 s − ε
-        // ---- 后 2 块：向左；邻居是前一个取样点（硬边界）----
+                          // ---- 后 2 块：向左；邻居是前一个取样点（硬边界）----
         let left = strip_fallback_probes(
             5_000,
             FallbackDir::Left,
@@ -13400,7 +13725,10 @@ mod tests {
         assert!(!left.is_empty(), "左边有关键帧/步长候选");
         assert!(left.len() <= P27_MAX_ATTEMPTS, "候选数 ≤ 次数上限");
         for p in &left {
-            assert!(*p < 5_000 && *p > 4_000, "必须严格落在 (邻居, 原时刻) 之间：{p}");
+            assert!(
+                *p < 5_000 && *p > 4_000,
+                "必须严格落在 (邻居, 原时刻) 之间：{p}"
+            );
             assert!((p - 5_000).abs() <= P27_MAX_FALLBACK_MS, "距离 ≤ 上限");
             assert!(*p >= 0 && *p <= last, "不许越出视频流：{p}");
         }
@@ -13424,7 +13752,10 @@ mod tests {
         );
         assert!(!right.is_empty());
         for p in &right {
-            assert!(*p > 1_000 && *p < 2_000, "严格落在 (原时刻, 邻居) 之间：{p}");
+            assert!(
+                *p > 1_000 && *p < 2_000,
+                "严格落在 (原时刻, 邻居) 之间：{p}"
+            );
         }
         // 邻居很远时，上界由"视频流末端"接管（不许扫到视频流之外）
         let far = strip_fallback_probes(
@@ -13443,27 +13774,35 @@ mod tests {
         );
         assert!(far.len() <= P27_MAX_ATTEMPTS);
         // ---- 双上界：距离上限比"次数上限"更早生效时不许多试 ----
-        let near = strip_fallback_probes(
-            5_000,
-            FallbackDir::Left,
-            &kf,
-            None,
-            last,
-            64,
-            300,
-            200,
-        );
+        let near = strip_fallback_probes(5_000, FallbackDir::Left, &kf, None, last, 64, 300, 200);
         assert!(
             near.iter().all(|p| (p - 5_000).abs() <= 300),
             "距离上限是硬边界：{near:?}"
         );
         // ---- 退化输入 ----
-        assert!(strip_fallback_probes(5_000, FallbackDir::Left, &[], Some(5_000), last, 8, 5_000, 200)
-            .is_empty(), "窗口为空（邻居就是自己）→ 不试");
-        assert!(strip_fallback_probes(5_000, FallbackDir::Left, &kf, None, last, 0, 5_000, 200)
-            .is_empty(), "次数上限为 0 → 不试");
-        assert!(strip_fallback_probes(0, FallbackDir::Left, &kf, None, last, 8, 5_000, 200)
-            .is_empty(), "已经在片头 → 左边没有东西可试");
+        assert!(
+            strip_fallback_probes(
+                5_000,
+                FallbackDir::Left,
+                &[],
+                Some(5_000),
+                last,
+                8,
+                5_000,
+                200
+            )
+            .is_empty(),
+            "窗口为空（邻居就是自己）→ 不试"
+        );
+        assert!(
+            strip_fallback_probes(5_000, FallbackDir::Left, &kf, None, last, 0, 5_000, 200)
+                .is_empty(),
+            "次数上限为 0 → 不试"
+        );
+        assert!(
+            strip_fallback_probes(0, FallbackDir::Left, &kf, None, last, 8, 5_000, 200).is_empty(),
+            "已经在片头 → 左边没有东西可试"
+        );
         // 没有关键帧时靠小步长兜住，仍然有界
         let no_kf = strip_fallback_probes(
             5_000,
@@ -13498,7 +13837,11 @@ mod tests {
         assert_eq!(v, "hit");
         assert_eq!(decoded, 4_400, "必须停**在该处**");
         assert_eq!(attempts, 4, "原时刻 + 3 个候选 = 4 次，命中即停");
-        assert_eq!(calls, vec![5_000, 4_800, 4_600, 4_400], "顺序 = 原时刻 → 候选（最近的先）");
+        assert_eq!(
+            calls,
+            vec![5_000, 4_800, 4_600, 4_400],
+            "顺序 = 原时刻 → 候选（最近的先）"
+        );
         // 原时刻就能解 → 一次都不搜（不浪费）
         let mut calls: Vec<i64> = Vec::new();
         let r = p27_search_decode(5_000, &probes, |t| {
@@ -13508,9 +13851,15 @@ mod tests {
         assert_eq!(r.expect("应当命中").2, 1);
         assert_eq!(calls, vec![5_000]);
         // 全都不成 → 尝试次数 = 1 + 候选数（有界），错误取**第一次**那条
-        let r = p27_search_decode(5_000, &probes, |t| Err::<(), _>(format!("no frame near {t}")));
+        let r = p27_search_decode(5_000, &probes, |t| {
+            Err::<(), _>(format!("no frame near {t}"))
+        });
         let (err, attempts) = r.expect_err("全失败");
-        assert_eq!(attempts, 1 + probes.len(), "总尝试次数 = 1 + 候选数（有界）");
+        assert_eq!(
+            attempts,
+            1 + probes.len(),
+            "总尝试次数 = 1 + 候选数（有界）"
+        );
         assert!(
             err.contains("5000"),
             "带回来的应当是**第一次**的错误（最有信息量）：{err}"
@@ -13530,10 +13879,22 @@ mod tests {
         let mut clip = synthetic_clip_split(120_000, 6_000);
         clip.keyframes_ms = vec![0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000];
         let last = p27_sample_last_ms(6_000);
-        assert_eq!(thumb_keyframe(&clip, 119_999), Some(5_000), "末尾那一段 → 退回最后一个可解关键帧");
-        assert_eq!(thumb_keyframe(&clip, 6_000), Some(5_000), "正好压在末尾上的关键帧不许选");
+        assert_eq!(
+            thumb_keyframe(&clip, 119_999),
+            Some(5_000),
+            "末尾那一段 → 退回最后一个可解关键帧"
+        );
+        assert_eq!(
+            thumb_keyframe(&clip, 6_000),
+            Some(5_000),
+            "正好压在末尾上的关键帧不许选"
+        );
         assert_eq!(thumb_keyframe(&clip, 5_900), Some(5_000));
-        assert_eq!(thumb_keyframe(&clip, 4_100), Some(4_000), "视频流之内的照旧选最近的");
+        assert_eq!(
+            thumb_keyframe(&clip, 4_100),
+            Some(4_000),
+            "视频流之内的照旧选最近的"
+        );
         assert!(
             clip.keyframes_ms.iter().all(|k| *k <= last || *k == 6_000),
             "前提：6000 是唯一越界的那个关键帧"
@@ -13582,7 +13943,11 @@ mod tests {
             "frames={frames} samples={times:?} prev={:?} fallback={:?} failed={:?} \
              pending={:?} worker={} enabled={}",
             h.page.strip_prev.iter().map(|t| t.idx).collect::<Vec<_>>(),
-            h.page.strip_fallback.keys().map(|k| k.time).collect::<Vec<_>>(),
+            h.page
+                .strip_fallback
+                .keys()
+                .map(|k| k.time)
+                .collect::<Vec<_>>(),
             h.page.thumb_failed.iter().collect::<Vec<_>>(),
             h.page.thumb_pending,
             h.page.thumb_job_tx.is_some(),
@@ -13733,12 +14098,8 @@ mod tests {
         let span_end = 120_000i64;
         let tile_h = strip_tile_height();
         let k4 = strip_thumb_key(times[4], span_end, STRIP_TILE_W as u32, tile_h);
-        let borrowed = h.page.strip_thumbs[&strip_thumb_key(
-            times[3],
-            span_end,
-            STRIP_TILE_W as u32,
-            tile_h,
-        )]
+        let borrowed = h.page.strip_thumbs
+            [&strip_thumb_key(times[3], span_end, STRIP_TILE_W as u32, tile_h)]
             .tex
             .clone();
         h.page.insert_strip_fallback(
@@ -13763,14 +14124,20 @@ mod tests {
         }
         // P21/P25 的口径逐条复述：首贴左、尾贴右、相邻间隙相等、高 = 行高
         let rect = h.timeline();
-        assert!((with_fallback[0].left() - rect.left()).abs() <= 1.0, "首贴左");
+        assert!(
+            (with_fallback[0].left() - rect.left()).abs() <= 1.0,
+            "首贴左"
+        );
         assert!(
             (with_fallback[4].right() - rect.right()).abs() <= 1.0,
             "尾贴右"
         );
         let gap = with_fallback[1].left() - with_fallback[0].right();
         for w in with_fallback.windows(2) {
-            assert!((w[1].left() - w[0].right() - gap).abs() <= 1.0, "相邻间隙相等");
+            assert!(
+                (w[1].left() - w[0].right() - gap).abs() <= 1.0,
+                "相邻间隙相等"
+            );
         }
         for r in &with_fallback {
             assert!((r.height() - strip_tile_height()).abs() <= 1.0, "高 = 行高");
@@ -13849,7 +14216,10 @@ mod tests {
         ] {
             let line = p27_fallback_line(5_000, 4_400, src, "no frame");
             assert!(line.contains("reason=sample_failed"), "{line}");
-            assert!(line.contains(&format!("used_fallback_frame={tag}")), "{line}");
+            assert!(
+                line.contains(&format!("used_fallback_frame={tag}")),
+                "{line}"
+            );
             assert!(!line.contains("slot=empty"), "有兜底帧时不许写留空：{line}");
         }
         // 彻底失败那一行：如实写"这一格没有画面"
@@ -13940,5 +14310,47 @@ mod tests {
             attempts <= 1 + P27_MAX_ATTEMPTS,
             "尝试次数必须有界（实测 {attempts}）"
         );
+    }
+    #[test]
+    fn audio_only_clip_keeps_audio_playback_without_a_video_player() {
+        let mut page = EditorPage::new(&Config::default());
+        page.clip = Some(edit::Clip {
+            src: std::env::temp_dir().join("cap-no-such-audio-only.mp4"),
+            duration_ms: 1_000,
+            video: None,
+            audio: Some(edit::StreamInfo {
+                index: 0,
+                codec: "aac".into(),
+                width: 0,
+                height: 0,
+                fps: 0.0,
+                time_base: (1, 48_000),
+                sample_rate: 48_000,
+                channels: 2,
+                duration_ms: 1_000,
+            }),
+            keyframes_ms: Vec::new(),
+            keyframes_scanned: true,
+            health: edit::health::HealthReport::default(),
+        });
+        page.play_audio_output = false;
+        page.start_play();
+        let playing = page.play.as_ref().expect("纯音频也应进入播放态");
+        assert!(playing.player.is_none(), "无视频流时不应创建视频播放器");
+        assert!(playing.audio.is_some(), "音频链必须启动");
+        page.stop_play();
+    }
+
+    #[test]
+    fn opening_a_new_file_invalidates_the_previous_export() {
+        let mut page = EditorPage::new(&Config::default());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        page.export_rx = Some(rx);
+        page.exporting = true;
+        let old_epoch = page.export_epoch;
+        page.open(Path::new("cap-no-such-next-file.mp4"));
+        assert_ne!(page.export_epoch, old_epoch, "打开新素材必须递增导出世代");
+        assert!(page.export_rx.is_none(), "旧导出通道必须立即断开");
+        assert!(!page.exporting, "新素材不能被旧导出锁住导出按钮");
     }
 }

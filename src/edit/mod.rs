@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::AtomicBool;
 
 /// **剪辑页音频波形**（峰值金字塔 + AAC 解码 + 渐进发布）。
 ///
@@ -79,10 +80,7 @@ pub(crate) unsafe fn limit_decoder_pixels(dec: *mut ff::AVCodecContext) {
 /// # Safety
 /// `ictx` 必须是 `avformat_open_input` 成功返回的上下文。
 pub(crate) unsafe fn limit_input_probe(ictx: *mut ff::AVFormatContext) {
-    if !ictx.is_null() {
-        (*ictx).probesize = 8 * 1024 * 1024;
-        (*ictx).max_analyze_duration = 2 * AV_TIME_BASE;
-    }
+    crate::mux::limit_input_probe(ictx);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +401,7 @@ fn open_input_and_info(path: &Path) -> Result<(Input, Clip), AppError> {
                 av_err(ret)
             )));
         }
+        crate::mux::validate_input_streams(ictx.0)?;
 
         let mut video: Option<StreamInfo> = None;
         let mut audio: Option<StreamInfo> = None;
@@ -426,7 +425,11 @@ fn open_input_and_info(path: &Path) -> Result<(Input, Clip), AppError> {
                         codec: codec_name(par),
                         width: (*par).width,
                         height: (*par).height,
-                        fps: if fps.is_finite() && fps > 0.1 { fps } else { 0.0 },
+                        fps: if fps.is_finite() && fps > 0.1 {
+                            fps
+                        } else {
+                            0.0
+                        },
                         time_base: (tb.num, tb.den),
                         sample_rate: 0,
                         channels: 0,
@@ -495,10 +498,10 @@ pub fn probe(path: &Path) -> Result<Clip, AppError> {
 /// 但**必须留下证据** —— 否则界面无从解释"为什么后半段剪不动"）。
 ///
 /// `clip` 只需提供视频流下标、时间基与视频流时长。
-fn scan_pass(ictx: &Input, clip: &Clip) -> health::ScanPass {
+fn scan_pass(ictx: &Input, clip: &Clip, cancel: Option<&AtomicBool>) -> Option<health::ScanPass> {
     let Some(v) = clip.video.as_ref() else {
         // 纯音频素材：没有"视频编码错误"这回事，关键帧表也没什么可扫
-        return health::ScanPass::default();
+        return Some(health::ScanPass::default());
     };
     health::scan_pass(
         ictx,
@@ -508,6 +511,7 @@ fn scan_pass(ictx: &Input, clip: &Clip) -> health::ScanPass {
             den: v.time_base.1,
         },
         v.duration_ms,
+        cancel,
     )
 }
 
@@ -525,13 +529,31 @@ pub fn open_streaming<F: FnOnce(&Clip)>(
     path: &Path,
     emit: F,
 ) -> Result<(Clip, health::ScanPass), AppError> {
+    match open_streaming_cancel(path, emit, None)? {
+        Some(v) => Ok(v),
+        // 没有取消令牌就不可能出现"取消"分支；保持公开 API 的原有契约。
+        None => Err(AppError::Cancelled),
+    }
+}
+
+/// 同 [`open_streaming`]，但允许在探测后、扫描中协作取消。
+///
+/// `Ok(None)` 表示已取消：此时 `emit` 可能已经交出了 clip，但**不得**把半截关键帧表
+/// 当成完整结果应用（调用方应按世代丢弃）。取消检查在包循环内，最多再读一个包。
+pub(crate) fn open_streaming_cancel<F: FnOnce(&Clip)>(
+    path: &Path,
+    emit: F,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<(Clip, health::ScanPass)>, AppError> {
     let (ictx, clip) = open_input_and_info(path)?;
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Ok(None);
+    }
     emit(&clip);
     if clip.video.is_none() {
-        return Ok((clip, health::ScanPass::default()));
+        return Ok(Some((clip, health::ScanPass::default())));
     }
-    let pass = scan_pass(&ictx, &clip);
-    Ok((clip, pass))
+    Ok(scan_pass(&ictx, &clip, cancel).map(|pass| (clip, pass)))
 }
 
 /// 打开视频（分片 mp4 与普通 mp4 都可以），读取流信息、**扫描全部关键帧**并**做一次编码体检**。
@@ -720,10 +742,7 @@ impl Segment {
 /// 3. 每段吸附后必须 `start < end`（空段无法导出）；
 /// 4. **剔除硬编码坏段**（P35，见 [`resolve_segments_ex`]）；
 /// 5. 返回 `(吸附后的区间列表, 合并总时长)`，总时长 = Σ 各段长度。
-pub fn resolve_segments(
-    clip: &Clip,
-    raw: &[Segment],
-) -> Result<(Vec<Segment>, i64), AppError> {
+pub fn resolve_segments(clip: &Clip, raw: &[Segment]) -> Result<(Vec<Segment>, i64), AppError> {
     let (segs, total, _skipped) = resolve_segments_ex(clip, raw)?;
     Ok((segs, total))
 }
@@ -751,6 +770,11 @@ pub fn resolve_segments_ex(
     if raw.is_empty() {
         return Err(AppError::Mp4("没有需要导出的分段".into()));
     }
+    if clip.video.is_some() && clip.keyframes_ms.is_empty() {
+        return Err(AppError::Mp4(
+            "源视频没有可用关键帧，无法安全地执行 copy 导出".into(),
+        ));
+    }
     let mut snapped: Vec<Segment> = Vec::with_capacity(raw.len());
     for (i, seg) in raw.iter().enumerate() {
         let s = snap_start(clip, seg.start_ms);
@@ -758,8 +782,7 @@ pub fn resolve_segments_ex(
         // （与 effective_range 完全同口径，否则最后一个 GOP 会被无声丢掉）
         let tol = clip.snap_tolerance_ms();
         let e_snap = snap_end(clip, seg.end_ms);
-        let e = if (seg.end_ms as f64) + tol >= clip.duration_ms as f64
-            && clip.duration_ms > e_snap
+        let e = if (seg.end_ms as f64) + tol >= clip.duration_ms as f64 && clip.duration_ms > e_snap
         {
             clip.duration_ms
         } else {
@@ -773,7 +796,10 @@ pub fn resolve_segments_ex(
                 e
             )));
         }
-        snapped.push(Segment { start_ms: s, end_ms: e });
+        snapped.push(Segment {
+            start_ms: s,
+            end_ms: e,
+        });
     }
 
     // ---- P35：按硬编码坏段切开 ----
@@ -870,7 +896,17 @@ pub fn export_copy(
     end_ms: i64,
     dst: &Path,
 ) -> Result<ExportReport, AppError> {
-    export_ranges_inner(clip, &[Segment::new(start_ms, end_ms)], dst)
+    export_ranges_inner(clip, &[Segment::new(start_ms, end_ms)], dst, None)
+}
+
+pub(crate) fn export_copy_cancel(
+    clip: &Clip,
+    start_ms: i64,
+    end_ms: i64,
+    dst: &Path,
+    cancel: &AtomicBool,
+) -> Result<ExportReport, AppError> {
+    export_ranges_inner(clip, &[Segment::new(start_ms, end_ms)], dst, Some(cancel))
 }
 
 /// **导出的唯一实现**：单段 / 多段都走这里。
@@ -889,38 +925,74 @@ fn export_ranges_inner(
     clip: &Clip,
     segments: &[Segment],
     dst: &Path,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ExportReport, AppError> {
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(AppError::Mp4("导出已取消".into()));
+    }
     let (ranges, total_ms, skipped_ms) = resolve_segments_ex(clip, segments)?;
 
+    // 空间紧时优先关掉 `+faststart`：moov 留在文件末尾仍然可播、可继续剪辑，
+    // 比"写到一半因回拷空间不足而失败"好；连单份产物都放不下才报错。
+    let mut faststart = true;
     if let Some(dir) = dst.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)
                 .map_err(|err| AppError::Mp4(format!("创建目录 {} 失败：{err}", dir.display())))?;
-            // copy 导出至少要再写一份源文件大小的产物；不够就提前失败，别把盘写满。
+            // copy 导出按“选中时长 / 源时长”估算体积；播放列表允许重复片段，
+            // 所以不能简单假设产物 ≤ 源文件。`+faststart` 还要再回拷一份完整产物。
             if let Some(free) = crate::disk::free_bytes(dir) {
                 let src = std::fs::metadata(&clip.src).map(|m| m.len()).unwrap_or(0);
-                let need = src.saturating_add(8 * 1024 * 1024);
-                if src > 0 && free < need {
-                    return Err(AppError::Mp4(format!(
-                        "导出目录空间不足：需要约 {}，实际 {}（{}）",
-                        crate::disk::human(need),
-                        crate::disk::human(free),
-                        dir.display()
-                    )));
+                let source_span = clip.duration_ms.max(1) as u128;
+                let selected_span = total_ms.max(0) as u128;
+                let estimated = ((src as u128)
+                    .saturating_mul(selected_span)
+                    .saturating_add(source_span - 1)
+                    / source_span)
+                    .min(u64::MAX as u128) as u64;
+                // 10% 封装/音频余量 + faststart 临时回拷 + 固定安全余量。
+                let estimated = estimated
+                    .saturating_add(estimated / 10)
+                    .max(16 * 1024 * 1024);
+                if src > 0 {
+                    let fixed = 64 * 1024 * 1024;
+                    let single = estimated.saturating_add(fixed);
+                    let dual = estimated.saturating_mul(2).saturating_add(fixed);
+                    if free < single {
+                        return Err(AppError::Mp4(format!(
+                            "导出目录空间不足：至少需要约 {}，实际 {}（{}）",
+                            crate::disk::human(single),
+                            crate::disk::human(free),
+                            dir.display()
+                        )));
+                    }
+                    faststart = free >= dual;
                 }
             }
         }
     }
 
+    // 先在 `.part` 里写、读回校验，全部通过后才替换正式目标。
+    // 这样"导出到一半取消 / 产物时长异常 / 探测失败"都不会破坏用户已有的同名文件。
+    let out = mux::AtomicExport::new(&clip.src, dst)?;
     let range_pairs: Vec<(i64, i64)> = ranges.iter().map(|s| (s.start_ms, s.end_ms)).collect();
     let bytes = if range_pairs.len() == 1 {
-        mux::remux_range(&clip.src, dst, Some(range_pairs[0]))?
+        mux::remux_range_to(
+            &clip.src,
+            out.temp(),
+            Some(range_pairs[0]),
+            faststart,
+            cancel,
+        )?
     } else {
-        mux::remux_ranges(&clip.src, dst, &range_pairs)?
+        mux::remux_ranges_to(&clip.src, out.temp(), &range_pairs, faststart, cancel)?
     };
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(AppError::Mp4("导出已取消".into()));
+    }
 
     // ---- 自身校验 ----
-    let brief = mux::probe(dst)?;
+    let brief = mux::probe(out.temp())?;
     let dst_video = brief.streams.iter().find(|x| x.kind == "video");
     let (dst_width, dst_height) = dst_video.map(|v| (v.width, v.height)).unwrap_or((0, 0));
     let (src_width, src_height) = (clip.width(), clip.height());
@@ -943,9 +1015,9 @@ fn export_ranges_inner(
             ranges.len()
         )));
     }
-    let packets = count_packets(dst)?;
+    let packets = count_packets(out.temp())?;
     let bytes = if bytes == 0 {
-        std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(out.temp()).map(|m| m.len()).unwrap_or(0)
     } else {
         bytes
     };
@@ -973,6 +1045,10 @@ fn export_ranges_inner(
         packets,
         "copy 导出完成（未重新编码，分辨率未改变）"
     );
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(AppError::Mp4("导出已取消".into()));
+    }
+    out.commit()?;
 
     Ok(ExportReport {
         requested_start_ms: req_first.start_ms,
@@ -1008,11 +1084,26 @@ pub fn export_ranges(
     segments: &[Segment],
     dst: &Path,
 ) -> Result<ExportReport, AppError> {
-    export_ranges_inner(clip, segments, dst)
+    export_ranges_inner(clip, segments, dst, None)
+}
+
+pub(crate) fn export_ranges_cancel(
+    clip: &Clip,
+    segments: &[Segment],
+    dst: &Path,
+    cancel: &AtomicBool,
+) -> Result<ExportReport, AppError> {
+    export_ranges_inner(clip, segments, dst, Some(cancel))
 }
 
 /// 数一下文件里的 packet 数（导出报告用；只解封装、不解码）
 pub(crate) fn count_packets(path: &Path) -> Result<u64, AppError> {
+    if !path.is_file() {
+        return Err(AppError::Mp4(format!(
+            "只支持本地文件：{}",
+            path.display()
+        )));
+    }
     let c_path = cpath(path)?;
     // SAFETY: 所有指针都在本函数内分配并有 RAII 守卫；c_path 生命周期覆盖整个块。
     unsafe {
@@ -1026,6 +1117,8 @@ pub(crate) fn count_packets(path: &Path) -> Result<u64, AppError> {
             )));
         }
         let ictx = Input(raw);
+        limit_input_probe(ictx.0);
+        crate::mux::validate_input_streams(ictx.0)?;
         let pkt = Packet(ff::av_packet_alloc());
         if pkt.0.is_null() {
             return Err(AppError::Mp4("av_packet_alloc 失败".into()));
@@ -1056,6 +1149,12 @@ pub fn thumbnail(
     max_w: u32,
     max_h: u32,
 ) -> Result<(u32, u32, Vec<u8>), AppError> {
+    if !path.is_file() {
+        return Err(AppError::Mp4(format!(
+            "只支持本地文件：{}",
+            path.display()
+        )));
+    }
     let c_path = cpath(path)?;
     let max_w = max_w.max(1);
     let max_h = max_h.max(1);
@@ -1078,6 +1177,7 @@ pub fn thumbnail(
         if ret < 0 {
             return Err(AppError::Mp4(format!("读取流信息失败：{}", av_err(ret))));
         }
+        crate::mux::validate_input_streams(ictx.0)?;
 
         // 找第一条视频流
         let mut vindex = -1i32;
@@ -1114,7 +1214,10 @@ pub fn thumbnail(
         limit_decoder_pixels(codec_guard.0);
         let ret = ff::avcodec_open2(codec_guard.0, codec, ptr::null_mut());
         if ret < 0 {
-            return Err(AppError::Mp4(format!("打开视频解码器失败：{}", av_err(ret))));
+            return Err(AppError::Mp4(format!(
+                "打开视频解码器失败：{}",
+                av_err(ret)
+            )));
         }
 
         // 定位到目标时刻之前的关键帧（失败就从文件开头解，最多多解几帧）
@@ -1168,7 +1271,9 @@ pub fn thumbnail(
                 }
                 packets_read += 1;
                 if packets_read > 4000 {
-                    tracing::warn!("缩略图解码超过 4000 个包仍未命中目标时刻，使用已解出的最后一帧");
+                    tracing::warn!(
+                        "缩略图解码超过 4000 个包仍未命中目标时刻，使用已解出的最后一帧"
+                    );
                     break;
                 }
             } else {
@@ -1234,10 +1339,7 @@ unsafe fn convert_to_rgba(
     // 缓存的 sws 上下文与 key（格式/尺寸）一致。
     let written = SWS_CACHE.with(|cell| -> Result<i32, AppError> {
         let mut slot = cell.borrow_mut();
-        let rebuild = slot
-            .as_ref()
-            .map(|(k, _)| *k != key)
-            .unwrap_or(true);
+        let rebuild = slot.as_ref().map(|(k, _)| *k != key).unwrap_or(true);
         if rebuild {
             // SAFETY: 参数来自 FFmpeg 自己的格式表与当前帧尺寸；失败返回空指针。
             let ctx = unsafe {
@@ -1339,7 +1441,8 @@ mod tests {
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr).to_string();
                 // 随包 ffmpeg 理论上带 libopenh264，但换机器可能没有；此时跳过而不是误报失败
-                if err.contains("Unknown encoder") || err.to_ascii_lowercase().contains("openh264") {
+                if err.contains("Unknown encoder") || err.to_ascii_lowercase().contains("openh264")
+                {
                     println!("[skip] 随包 ffmpeg 不具备 libopenh264 编码能力：{err}");
                     None
                 } else {
@@ -1385,7 +1488,11 @@ mod tests {
         // 半帧容差（30 fps 下 16.67 ms）允许"比请求早不到一帧"的关键帧入选：
         // 这正是防止跳过一个 GOP 的代价，肉眼不可分辨；超过半帧就必须往后找。
         assert_eq!(snap_start(&clip, 1), 0, "1 ms 落在 0 的半帧容差内");
-        assert_eq!(snap_start(&clip, 20), 1000, "超过半帧就必须吸附到后一个关键帧");
+        assert_eq!(
+            snap_start(&clip, 20),
+            1000,
+            "超过半帧就必须吸附到后一个关键帧"
+        );
         assert_eq!(snap_start(&clip, 999), 1000);
         assert_eq!(snap_start(&clip, 1000), 1000, "正好落在关键帧上时保持不动");
         assert_eq!(snap_start(&clip, 1500), 2000);
@@ -1418,7 +1525,16 @@ mod tests {
         assert_eq!(snap_start(&clip, 3030), 5999);
         assert_eq!(snap_end(&clip, 2980), 0, "2980 与 2999 差 19 ms > 半帧");
         // ts_to_ms 本身按最近毫秒取整：269999 @ 1/90000 → 3000
-        assert_eq!(ts_to_ms(269_999, ff::AVRational { num: 1, den: 90_000 }), 3000);
+        assert_eq!(
+            ts_to_ms(
+                269_999,
+                ff::AVRational {
+                    num: 1,
+                    den: 90_000
+                }
+            ),
+            3000
+        );
         // 帧率未知时按 1/60 秒估帧周期（容差 ≈ 8.33 ms）
         let unknown = synthetic_clip(6_000, vec![0, 2999], 0.0);
         assert!((unknown.frame_period_ms() - 1000.0 / 60.0).abs() < 1e-6);
@@ -1496,7 +1612,10 @@ mod tests {
         let clip = synthetic_clip(10_000, vec![0, 1000, 2000, 3000, 4000], 30.0);
 
         // 空关键帧列表 → None（绝不 panic、绝不返回 0 冒充一个关键帧）
-        assert_eq!(nearest_keyframe(&synthetic_clip(10_000, vec![], 30.0), 1500), None);
+        assert_eq!(
+            nearest_keyframe(&synthetic_clip(10_000, vec![], 30.0), 1500),
+            None
+        );
         // 时长为 0 / 负数的退化素材也一样
         assert_eq!(nearest_keyframe(&synthetic_clip(0, vec![], 30.0), 0), None);
 
@@ -1519,7 +1638,10 @@ mod tests {
         assert_eq!(nearest_keyframe(&clip, 1500), Some(1000));
         assert_eq!(nearest_keyframe(&clip, 2600), Some(3000));
         // 单个关键帧：任何位置都只有它
-        assert_eq!(nearest_keyframe(&synthetic_clip(10_000, vec![1234], 30.0), 0), Some(1234));
+        assert_eq!(
+            nearest_keyframe(&synthetic_clip(10_000, vec![1234], 30.0), 0),
+            Some(1234)
+        );
     }
 
     #[test]
@@ -1545,7 +1667,10 @@ mod tests {
         );
         for (i, k) in clip.keyframes_ms.iter().enumerate().take(4) {
             let want = (i as i64) * 1000;
-            assert!((*k - want).abs() <= 20, "第 {i} 个关键帧应约 {want} ms，实际 {k}");
+            assert!(
+                (*k - want).abs() <= 20,
+                "第 {i} 个关键帧应约 {want} ms，实际 {k}"
+            );
         }
     }
 
@@ -1569,7 +1694,11 @@ mod tests {
         let clip = probe(&src).expect("probe 应成功");
         assert!(clip.video.is_some(), "探测就要能拿到视频流");
         assert!(clip.audio.is_some(), "探测就要能拿到音频流");
-        assert!(clip.duration_ms > 3500, "探测就要能拿到时长：{}", clip.duration_ms);
+        assert!(
+            clip.duration_ms > 3500,
+            "探测就要能拿到时长：{}",
+            clip.duration_ms
+        );
         assert!(
             clip.keyframes_ms.is_empty(),
             "探测段不扫关键帧，表必须为空（实测 {:?}）",
@@ -1625,6 +1754,44 @@ mod tests {
             pass.health, full.health,
             "流式续扫的体检结论必须与同步 open 一致"
         );
+    }
+
+    /// 打开前已取消：连 `emit` 都不该发生，更不该开始扫全片。
+    #[test]
+    fn open_streaming_cancel_before_emit_returns_none() {
+        let Some(src) = gen_mp4("open-cancel-before.mp4", false) else {
+            return;
+        };
+        let cancel = AtomicBool::new(true);
+        let emitted = std::sync::Arc::new(AtomicBool::new(false));
+        let r = {
+            let emitted = emitted.clone();
+            open_streaming_cancel(
+                &src,
+                move |_| emitted.store(true, std::sync::atomic::Ordering::Relaxed),
+                Some(&cancel),
+            )
+            .expect("取消不是 IO 错误")
+        };
+        assert!(r.is_none(), "取消后不得返回扫描结果");
+        assert!(!emitted.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// emit 之后、扫描过程中取消：返回 `None`，而不是把半截表当成完整结果。
+    #[test]
+    fn open_streaming_cancel_during_scan_discards_partial_table() {
+        let Some(src) = gen_mp4("open-cancel-scan.mp4", false) else {
+            return;
+        };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let emit_cancel = cancel.clone();
+        let r = open_streaming_cancel(
+            &src,
+            move |_| emit_cancel.store(true, std::sync::atomic::Ordering::Relaxed),
+            Some(&cancel),
+        )
+        .expect("取消不是 IO 错误");
+        assert!(r.is_none(), "取消后不能把半截关键帧表交给界面");
     }
 
     /// **P34：没有视频流时没有"第二段"** —— 表直接是最终态（空），不等扫描。
@@ -1688,7 +1855,10 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
         let e = open_streaming(&missing, |_| {}).expect_err("不存在的文件必须报错");
         let msg = e.to_string();
-        assert!(msg.contains("文件不存在") || msg.contains("打开"), "错误要有信息：{msg}");
+        assert!(
+            msg.contains("文件不存在") || msg.contains("打开"),
+            "错误要有信息：{msg}"
+        );
     }
 
     // =======================================================================
@@ -1705,11 +1875,26 @@ mod tests {
         let _ = std::fs::remove_file(&out);
         let o = std::process::Command::new(&ff)
             .args([
-                "-y", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30",
-                "-t", "3", "-c:v", "libopenh264", "-b:v", "300k",
-                "-g", "30", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=30",
+                "-t",
+                "3",
+                "-c:v",
+                "libopenh264",
+                "-b:v",
+                "300k",
+                "-g",
+                "30",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
             ])
             .arg(&out)
             .output()
@@ -1747,11 +1932,7 @@ mod tests {
             "体检必须报告覆盖时长（否则界面无从显示进度）"
         );
         assert!(!clip.keyframes_ms.is_empty(), "关键帧表照常产出");
-        assert_eq!(
-            clip.health.hard_ranges(),
-            Vec::new(),
-            "硬坏段列表必须为空"
-        );
+        assert_eq!(clip.health.hard_ranges(), Vec::new(), "硬坏段列表必须为空");
     }
 
     /// **截断素材：必须被查出来，并且归成"硬错误"**。
@@ -1808,6 +1989,16 @@ mod tests {
         assert_eq!(segs, vec![Segment::new(0, 4_000)], "区间必须原样保留");
         assert_eq!(total, 4_000);
         assert_eq!(skipped, 0, "干净素材不许报「跳过了多少」");
+    }
+
+    /// 有视频但没有任何关键帧时不能继续 copy 导出：
+    /// `snap_start` 的降级会让产物从非关键帧开头，播放器可能直接花屏。
+    #[test]
+    fn export_rejects_video_without_any_keyframe() {
+        let clip = synthetic_clip(10_000, vec![], 30.0);
+        let err = resolve_segments_ex(&clip, &[Segment::new(0, 2_000)])
+            .expect_err("无关键帧视频必须拒绝导出");
+        assert!(err.to_string().contains("关键帧"), "{err}");
     }
 
     /// **P35：硬坏段被切掉，且新起点重新吸附到关键帧**（否则产物开头花屏）。
@@ -1870,8 +2061,8 @@ mod tests {
             health::BadKind::ShortData,
             "整片截断",
         ));
-        let e = resolve_segments_ex(&clip, &[Segment::new(0, 3_000)])
-            .expect_err("全在坏区里必须报错");
+        let e =
+            resolve_segments_ex(&clip, &[Segment::new(0, 3_000)]).expect_err("全在坏区里必须报错");
         assert!(
             e.to_string().contains("编码错误"),
             "错误信息要说清楚是坏段导致的：{e}"
@@ -1918,8 +2109,8 @@ mod tests {
         };
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut progress_calls = 0usize;
-        let rep = health::deep_scan(&src, &cancel, |_| progress_calls += 1)
-            .expect("深度检查应成功");
+        let rep =
+            health::deep_scan(&src, &cancel, |_| progress_calls += 1).expect("深度检查应成功");
         assert!(rep.full_decode, "深度检查必须标记 full_decode");
         assert!(
             rep.is_clean(),
@@ -1942,7 +2133,10 @@ mod tests {
         // 一开始就置取消：线程必须在**第一个包之前**就退出来
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let r = health::deep_scan(&src, &cancel, |_| {});
-        assert!(r.is_err(), "已取消时必须返回 Err（绝不能被当成「检查通过」）");
+        assert!(
+            r.is_err(),
+            "已取消时必须返回 Err（绝不能被当成「检查通过」）"
+        );
     }
 
     /// **P34 量化对照（手动跑，默认忽略）**：长片上 `probe` 与 `open`（含全文件关键帧扫描）的耗时差。
@@ -2036,7 +2230,11 @@ mod tests {
         };
         let (w, h, rgba) = thumbnail(&src, 1500, 160, 120).expect("thumbnail 应成功");
         assert!(w <= 160 && h <= 120, "不得超过 max：实际 {w}x{h}");
-        assert_eq!((w, h), (160, 120), "320x240 等比缩到不超过 160x120 应为 160x120");
+        assert_eq!(
+            (w, h),
+            (160, 120),
+            "320x240 等比缩到不超过 160x120 应为 160x120"
+        );
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         // testsrc2 是彩色测试图，转换后不可能全是同一个值
         let first = &rgba[..4];
@@ -2060,7 +2258,11 @@ mod tests {
         assert!(rep.same_resolution, "分辨率必须与源一致");
         assert!(rep.is_bitstream_copy(), "必须是位流拷贝");
         assert_eq!((rep.dst_width, rep.dst_height), (320, 240));
-        assert_eq!((rep.start_ms, rep.end_ms), (2000, 3000), "应吸附到 2 s..3 s");
+        assert_eq!(
+            (rep.start_ms, rep.end_ms),
+            (2000, 3000),
+            "应吸附到 2 s..3 s"
+        );
         assert_eq!(rep.duration_ms(), 1000);
         assert!(rep.bytes > 0 && rep.packets > 0, "应有真实产物与 packet");
         assert!(
@@ -2069,6 +2271,59 @@ mod tests {
             rep.dst_duration_ms
         );
         assert!(dst.is_file());
+    }
+
+    /// 取消导出必须保留用户已有的同名文件，且不留下 `.part`。
+    #[test]
+    fn cancelled_export_copy_preserves_existing_destination() {
+        let Some(src) = gen_mp4("export-cancel-src.mp4", false) else {
+            return;
+        };
+        let clip = open(&src).expect("open 应成功");
+        let dst = asset_dir().join("export-cancel-existing.mp4");
+        let stable = b"existing export must survive cancellation";
+        std::fs::write(&dst, stable).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let err =
+            export_copy_cancel(&clip, 0, 2_000, &dst, &cancel).expect_err("预取消的导出必须失败");
+        assert!(err.to_string().contains("取消"), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), stable);
+        let leftovers: Vec<_> = std::fs::read_dir(asset_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".export-cancel-existing.mp4.") && n.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "取消后残留临时文件：{leftovers:?}");
+    }
+
+    /// 产物写完后校验失败也不能替换正式目标：用户已有的同名文件必须原样保留。
+    #[test]
+    fn failed_post_export_validation_preserves_existing_destination() {
+        let Some(src) = gen_mp4("export-verify-fail-src.mp4", false) else {
+            return;
+        };
+        let mut clip = open(&src).expect("open 应成功");
+        // 人为制造"源声称 123x240、产物实际 320x240"的校验失败。
+        clip.video.as_mut().expect("应有视频流").width = 123;
+        let dst = asset_dir().join("export-verify-fail-existing.mp4");
+        let stable = b"existing export must survive failed validation";
+        std::fs::write(&dst, stable).unwrap();
+
+        let err = export_copy(&clip, 0, 2_000, &dst).expect_err("分辨率校验必须失败");
+        assert!(err.to_string().contains("分辨率"), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), stable);
+        let leftovers: Vec<_> = std::fs::read_dir(asset_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".export-verify-fail-existing.mp4.") && n.ends_with(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "校验失败后残留临时文件：{leftovers:?}"
+        );
     }
 
     #[test]
@@ -2223,7 +2478,11 @@ mod tests {
         assert_eq!(rep.segments, 1);
         assert_eq!(rep.total_duration_ms, rep.duration_ms());
         let (s, e) = effective_range(&clip, 1000, 2500).expect("有效区间");
-        assert_eq!((rep.start_ms, rep.end_ms), (s, e), "单段口径应与 export_copy 相同");
+        assert_eq!(
+            (rep.start_ms, rep.end_ms),
+            (s, e),
+            "单段口径应与 export_copy 相同"
+        );
         assert_eq!((s, e), (1000, 2000), "1000..2500 吸附成 (1000, 2000)");
     }
 }

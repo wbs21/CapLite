@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="CapLite"
-      version="1.0.1.0"
+      version="1.0.2.0"
       processorArchitecture="amd64"/>
 
   <!-- 显式 asInvoker：永远不要因为 exe/目录的启发式而弹 UAC。 -->

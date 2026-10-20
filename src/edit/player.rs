@@ -217,6 +217,12 @@ fn decode_loop(
     out: &SyncSender<FrameRgba>,
     eof: &AtomicBool,
 ) -> Result<(), AppError> {
+    if !path.is_file() {
+        return Err(AppError::Mp4(format!(
+            "播放只支持本地文件：{}",
+            path.display()
+        )));
+    }
     let c_path = cpath(path)?;
     // SAFETY: 本节创建的每个 FFmpeg 对象都由对应的 RAII 守卫持有，
     // 作用域结束（含任何提前 return）时按声明逆序释放；指针在守卫存活期间始终有效。
@@ -235,6 +241,7 @@ fn decode_loop(
         if ff::avformat_find_stream_info(ictx.0, ptr::null_mut()) < 0 {
             return Err(AppError::Mp4("读取流信息失败".into()));
         }
+        crate::mux::validate_input_streams(ictx.0)?;
 
         // 第一条视频流
         let mut vindex = -1i32;

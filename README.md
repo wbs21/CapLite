@@ -1,4 +1,4 @@
-# CapLite 1.0.1
+# CapLite 1.0.2
 
 **CapLite** is a lightweight, green-install (no installer) screen recorder and clipper for
 Windows x64. It records the screen — a whole monitor or a region you drag out — together
@@ -172,7 +172,7 @@ The released ZIP needs none of that — it ships its own DLLs.
 
 ## Install and run
 
-CapLite is portable. Extract `CapLite-1.0.1-win64.zip` anywhere and run `CapLite.exe`;
+CapLite is portable. Extract `CapLite-1.0.2-win64.zip` anywhere and run `CapLite.exe`;
 keep the `runtime\` folder next to it (it contains the 7 required DLLs). There is no
 installer and no registry state. Uninstall = delete the extracted folder.
 

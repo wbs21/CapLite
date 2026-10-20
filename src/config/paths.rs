@@ -13,6 +13,7 @@
 //! * 所有相对路径都以 **exe 目录**为基准解析，不依赖 CWD。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// 回退到 exe 同级时使用的子目录名（`<exe 目录>\cap-recordings`）。
 pub(crate) const EXE_SUBDIR: &str = "cap-recordings";
@@ -82,11 +83,22 @@ pub fn probe_dir_writable(dir: &Path) -> Result<(), String> {
         .unwrap_or(0);
     let name = format!(".cap-write-probe-{}-{nanos}.tmp", std::process::id());
     let probe = dir.join(name);
-    if let Err(e) = std::fs::write(&probe, b"cap-write-probe") {
-        // 失败时也可能留下残file，尽力清掉；清理失败不改变结论
+    // create_new 而不是 write：探测文件也不能跟随预先放好的链接。
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(format!("创建探测文件失败：{e}")),
+    };
+    use std::io::Write as _;
+    if let Err(e) = f.write_all(b"cap-write-probe") {
+        drop(f);
         let _ = std::fs::remove_file(&probe);
         return Err(format!("写入探测文件失败：{e}"));
     }
+    drop(f);
     if let Err(e) = std::fs::remove_file(&probe) {
         // 删不掉说明目录权限有问题（能写不能删），同样视为不可用
         return Err(format!("删除探测文件失败：{e}"));
@@ -97,6 +109,17 @@ pub fn probe_dir_writable(dir: &Path) -> Result<(), String> {
 /// 带超时的可写探测：网络盘/休眠移动盘上的 `create_dir_all` 可能卡几十秒，
 /// 启动路径不能无限等。探测线程超时后仍在后台，但主流程继续回落。
 pub fn probe_dir_writable_timeout(dir: &Path) -> Result<(), String> {
+    probe_dir_writable_timeout_with_budget(dir, Duration::from_millis(1500))
+}
+
+/// 带调用方预算版本：配置目录回退链共享一个总预算，避免每个候选都重新等 1.5 s。
+pub fn probe_dir_writable_timeout_with_budget(
+    dir: &Path,
+    budget: Duration,
+) -> Result<(), String> {
+    if budget.is_zero() {
+        return Err(format!("目录探测预算已耗尽：{}", dir.display()));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let p = dir.to_path_buf();
     let spawned = std::thread::Builder::new()
@@ -107,10 +130,14 @@ pub fn probe_dir_writable_timeout(dir: &Path) -> Result<(), String> {
     if spawned.is_err() {
         return Err("探测线程创建失败".into());
     }
-    match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+    match rx.recv_timeout(budget) {
         Ok(r) => r,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(format!("目录探测超过 1500 ms：{}", dir.display()))
+            Err(format!(
+                "目录探测超过 {} ms：{}",
+                budget.as_millis(),
+                dir.display()
+            ))
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(format!("目录探测线程异常退出：{}", dir.display()))

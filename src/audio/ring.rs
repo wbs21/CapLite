@@ -26,10 +26,10 @@
 //! 就够了 —— 临界区只是一次 `extend`/`drain`，锁无竞争，比引新依赖划算；
 //! 丢失语义（满则丢最旧）与可等待都是现成的。
 
+use crate::sync::lock_or_recover;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::lock_or_recover;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -152,10 +152,10 @@ impl AudioRing {
 /// `new()` → `start_transport()` → 读取线程 `push()` / 消费线程 `pop_available()` → `stop()`。
 ///
 /// # 线程安全约定
-/// 搬运线程体内持有指向 `self` 的裸指针，因此 **`stop()` 必须在最后一次使用之前调用**
-/// （`stop()` 会 join 搬运线程）。`Drop` 里会兜底再 `stop()` 一次，正常路径由录制收尾
-/// 显式调用。小环只被"读取线程写、搬运线程读"，大环只被"搬运线程写、消费线程读"
-/// （SPSC），与 `AudioRing` 的约定一致。
+/// 搬运线程持有 `Arc<Self>`，对象生命周期由引用计数保证，不再依赖“先 stop 再析构”的
+/// 人肉约定。`stop()` 仍负责置位并 join，让收尾及时；忘记调用时也会在最后一个 `Arc`
+/// 释放后由 `Drop` 兜底。小环只被"读取线程写、搬运线程读"，大环只被
+/// "搬运线程写、消费线程读"（SPSC），与 `AudioRing` 的约定一致。
 pub struct AudioGateway {
     small: AudioRing,
     big: AudioRing,
@@ -209,21 +209,18 @@ impl AudioGateway {
     /// 而这里是**录制启动路径**，spawn 失败（线程数打满 / 资源不足）会直接把整个进程带崩。
     /// 全仓其它四处线程创建都走 `map_err → AppError`，这里没有理由例外：
     /// 交给调用方转成一条用户能看到的错误，而不是 panic。
-    pub fn start_transport(&self) -> Result<(), std::io::Error> {
+    pub fn start_transport(self: &Arc<Self>) -> Result<(), std::io::Error> {
         let mut slot = lock_or_recover(&self.transport);
         if slot.is_some() {
             return Ok(());
         }
-        // 搬运线程持裸指针访问 self：stop() 先置标志再 join，保证线程退出早于析构。
-        let self_ptr = SendPtr(self as *const AudioGateway);
+        // 线程只持 `Weak`：外部最后一个 `Arc` 释放时 `Drop` 仍能执行并 join；
+        // 若线程持有强引用，"忘记 stop" 就会让对象和线程互相续命。
+        let gateway = Arc::downgrade(self);
         let handle = thread::Builder::new()
             .name("cap-audio-transport".into())
             .spawn(move || {
-                // SAFETY: 见类型文档的"线程安全约定" —— stop() 总会先 join 本线程。
-                // 注意：必须经 SendPtr 的方法访问（2021 版闭包按字段捕获，
-                // 直接写 `self_ptr.0` 会只捕获裸指针字段，Send 包装就失效了）。
-                let gw = unsafe { self_ptr.get() };
-                transport_loop(gw);
+                transport_loop(&gateway);
             })?;
         *slot = Some(handle);
         Ok(())
@@ -250,37 +247,28 @@ impl Default for AudioGateway {
     }
 }
 
-/// 让 `*const AudioGateway` 能进线程闭包（原始指针默认不是 `Send`）。
-///
-/// 安全性由 [`AudioGateway`] 的“stop()-before-drop”约定保证：
-/// `stop()` 先置停止标志再 join 搬运线程，闭包内的引用绝不活过 `self`。
-///
-/// ⚠️ 访问指针**只能经 [`SendPtr::get`]**：Rust 2021 的闭包按字段捕获，
-/// 直接读 `.0` 会只捕获裸指针本身，`Send` 包装即失效（编译直接报错）。
-struct SendPtr(*const AudioGateway);
-unsafe impl Send for SendPtr {}
-
-impl SendPtr {
-    /// # Safety
-    /// 调用方必须保证指针指向的对象活得比本引用长。
-    /// 搬运线程侧由 `stop()`-before-drop 约定保证（见 [`AudioGateway`] 文档）。
-    unsafe fn get(&self) -> &AudioGateway {
-        &*self.0
-    }
-}
-
 impl Drop for AudioGateway {
     fn drop(&mut self) {
-        // 兜底：忘了显式 stop 也不能让裸指针悬空
-        self.stop();
+        // 兜底只叫停、不 join：最后一个 `Arc` 可能正是在搬运线程里释放的，
+        // 此时 join 自己会死锁。正常路径由 `stop()` 负责 join。
+        self.stop.store(true, Ordering::SeqCst);
+        self.small.notify();
+        self.big.notify();
     }
 }
 
 /// 搬运线程主体：小环 → 大环。跑在 `Highest` 优先级（见 [`crate::sys`]）。
-fn transport_loop(gw: &AudioGateway) {
+fn transport_loop(weak: &std::sync::Weak<AudioGateway>) {
     set_current_thread_priority(ThreadPriority::Highest);
     let mut chunk: Vec<f32> = Vec::new();
-    while !gw.stop.load(Ordering::SeqCst) {
+    loop {
+        // 每轮短暂升级：等待期间不长期持有强引用，否则析构永远等不到。
+        let Some(gw) = weak.upgrade() else {
+            break;
+        };
+        if gw.stop.load(Ordering::SeqCst) {
+            break;
+        }
         let got = gw.small.pop_available_into(&mut chunk);
         if got > 0 {
             // 大环满（消费侧停了 10 s 以上）：丢最旧，照样搬 —— 保最新
@@ -293,9 +281,11 @@ fn transport_loop(gw: &AudioGateway) {
         gw.small.wait_data(TRANSPORT_IDLE_WAIT);
     }
     // 收尾：把残留搬完（停止后不会有新数据进来了）
-    let got = gw.small.pop_available_into(&mut chunk);
-    if got > 0 {
-        gw.big.push_slice(&chunk);
+    if let Some(gw) = weak.upgrade() {
+        let got = gw.small.pop_available_into(&mut chunk);
+        if got > 0 {
+            gw.big.push_slice(&chunk);
+        }
     }
 }
 
@@ -369,7 +359,7 @@ mod tests {
     /// 两层网关的端到端：push 进小环 → 搬运线程搬进大环 → 消费端读到的就是原数据。
     #[test]
     fn gateway_moves_small_to_big() {
-        let gw = AudioGateway::new();
+        let gw = Arc::new(AudioGateway::new());
         gw.start_transport().expect("搬运线程应能启动");
         let data: Vec<f32> = (0..4_800 * TARGET_CHANNELS)
             .map(|i| i as f32 * 0.001)
@@ -390,7 +380,7 @@ mod tests {
     /// 停止后搬运线程退出、残留小环数据被搬空（stop 不吞数据）。
     #[test]
     fn stop_flushes_the_small_ring() {
-        let gw = AudioGateway::new();
+        let gw = Arc::new(AudioGateway::new());
         gw.start_transport().expect("搬运线程应能启动");
         // 直接把数据塞进小环（不等搬运），然后立即 stop
         let data: Vec<f32> = (0..1_000).map(|i| i as f32).collect();
@@ -405,7 +395,7 @@ mod tests {
     /// 25 秒的数据塞进 10 秒的大环 → 必然触发"丢最旧保最新"路径。
     #[test]
     fn gateway_survives_sustained_push_without_consumer() {
-        let gw = AudioGateway::new();
+        let gw = Arc::new(AudioGateway::new());
         gw.start_transport().expect("搬运线程应能启动");
         let chunk: Vec<f32> = (0..48_000 * TARGET_CHANNELS) // 1 秒/批
             .map(|i| (i % 97) as f32)
@@ -448,5 +438,20 @@ mod tests {
         }
         assert!(!gw.big().is_empty());
         gw.stop();
+    }
+
+    /// 忘记 `stop()` 时，最后一个 `Arc` 释放必须真的回收对象与搬运线程；
+    /// 搬运线程只持 `Weak`，不能反过来把对象吊住。
+    #[test]
+    fn dropping_last_arc_without_stop_reclaims_gateway() {
+        let gw = Arc::new(AudioGateway::new());
+        gw.start_transport().expect("搬运线程应能启动");
+        let weak = Arc::downgrade(&gw);
+        drop(gw);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(weak.upgrade().is_none(), "忘记 stop 也不得泄漏网关");
     }
 }

@@ -31,6 +31,11 @@ pub fn resolve_config_dir(value: &str) -> Option<PathBuf> {
 pub const CONFIG_FILE: &str = paths::CONFIG_FILE;
 /// 配置 JSON 的大小上限：正常只有几 KB；超过它说明文件损坏或被恶意放大。
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// 配置文件读取的总预算。正常本地磁盘是毫秒级；超过它基本只剩
+/// 断网 UNC / 休眠盘 / 被安全软件挂起几种情况，启动不应无限等。
+const CONFIG_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// 配置目录回退链的总探测预算。单个候选仍限制 1.5 s，但所有候选共享这个上限。
+const CONFIG_DIR_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CaptureMode {
@@ -72,7 +77,12 @@ pub struct Region {
 impl Default for Region {
     fn default() -> Self {
         // 未知屏幕尺寸时的保守默认：1280x720，随后会被真实显示器尺寸覆盖
-        Self { x: 0, y: 0, width: 1280, height: 720 }
+        Self {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        }
     }
 }
 
@@ -209,7 +219,6 @@ pub struct Config {
     /// 只有测试（`recorder_smoke --gop N`）会在 `sanitized()` **之后**直接覆盖它。
     pub keyframe_interval_sec: u32,
 
-
     // 音频
     /// AAC 码率（kbps）。**外部没有这一项了**，[`Config::sanitized`] 一律归一为
     /// [`FIXED_AUDIO_BITRATE_KBPS`]（192）。
@@ -280,7 +289,7 @@ impl Default for Config {
             audio_bitrate_kbps: FIXED_AUDIO_BITRATE_KBPS,
 
             // 隐私默认：热键/托盘开始的录制**不隐藏窗口**。用户显式开启后才隐藏。
-    hide_to_tray_on_record_start: false,
+            hide_to_tray_on_record_start: false,
             global_hotkey_enabled: true,
             hotkey_preset: HotkeyPreset::CtrlAltR,
             hotkey_custom: String::new(),
@@ -376,7 +385,12 @@ impl Config {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(AppError::Config(format!("读取 {} 失败：{e}", path.display()))),
+            Err(e) => {
+                return Err(AppError::Config(format!(
+                    "读取 {} 失败：{e}",
+                    path.display()
+                )))
+            }
         };
         let cfg: Self = serde_json::from_str(&text)
             .map_err(|e| AppError::Config(format!("解析 {} 失败：{e}", path.display())))?;
@@ -425,11 +439,7 @@ impl Config {
         let mut tmp: Option<PathBuf> = None;
         let mut last_err: Option<std::io::Error> = None;
         for attempt in 0..16u32 {
-            let name = format!(
-                "{stem}.{}.{}.{attempt}.tmp",
-                std::process::id(),
-                nanos
-            );
+            let name = format!("{stem}.{}.{}.{attempt}.tmp", std::process::id(), nanos);
             let candidate = dir.join(name);
             use std::io::Write as _;
             match std::fs::OpenOptions::new()
@@ -480,8 +490,9 @@ impl Config {
         // 只有**旧文件本身能解析**时才覆盖 bak —— 否则主文件已经损坏时，
         // 这次保存会把唯一一份好的 bak 也踩成坏 JSON。
         if path.is_file() && Config::load_from(path).is_ok() {
-            let bak = path.with_extension("json.bak");
-            let _ = std::fs::copy(path, &bak);
+            if let Err(e) = refresh_backup(path) {
+                tracing::warn!(path = %path.display(), error = %e, "刷新配置备份失败（继续保存主文件）");
+            }
         }
 
         // Windows 上 rename 在杀毒/索引器短暂占用目标时可能失败，做有限重试。
@@ -506,6 +517,54 @@ impl Config {
     }
 }
 
+/// 原子刷新 `.bak`。
+///
+/// 不能直接 `fs::copy(path, bak)`：如果 `bak` 已被预置成符号链接/junction，
+/// copy 会跟随它写到目标文件。这里先写同目录唯一临时文件，再**删除旧目录项**
+/// （删除链接只会移除链接本身）并 rename，攻击面只剩同目录竞态，且不会再跟随链接写。
+fn refresh_backup(path: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let bak = path.with_extension("json.bak");
+    let bytes = std::fs::read(path).map_err(|e| format!("读取主配置失败：{e}"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "配置路径没有父目录".to_string())?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.bak.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        nanos
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写备份临时文件失败：{e}"));
+    }
+    if let Err(e) = std::fs::remove_file(&bak) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("移除旧备份失败：{e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, &bak) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换备份失败：{e}"));
+    }
+    Ok(())
+}
+
 /// 配置文件位置的**可用性探测**与回退。
 ///
 /// 为什么需要它：实测（用户机器）里 `%APPDATA%\cap\CapRecorder` 这个目录
@@ -522,6 +581,8 @@ pub struct ConfigStore {
     path: PathBuf,
     /// 是否探测成功过（false = 所有候选目录都不可写，只能纯内存运行）
     writable: bool,
+    /// 启动读取失败/超时后进入的只读模式：目录仍然可写，但本次运行不再覆盖原配置。
+    read_only: bool,
     /// 需要显示一次的提示（例如"配置目录不可写，已改用 X"）
     pub notice: Option<String>,
 }
@@ -529,7 +590,14 @@ pub struct ConfigStore {
 impl ConfigStore {
     /// 探测配置目录。`explicit` 来自命令行 `--config-dir`（优先级最高）。
     pub fn detect(explicit: Option<PathBuf>) -> Self {
-        Self::detect_with(explicit, &paths::probe_dir_writable_timeout)
+        let deadline = std::time::Instant::now() + CONFIG_DIR_PROBE_BUDGET;
+        Self::detect_with(explicit, &|dir: &Path| {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            paths::probe_dir_writable_timeout_with_budget(
+                dir,
+                left.min(std::time::Duration::from_millis(1500)),
+            )
+        })
     }
 
     /// 可注入探测函数的版本，便于单测回退链而不碰真实文件系统。
@@ -538,16 +606,27 @@ impl ConfigStore {
         probe: &dyn Fn(&Path) -> Result<(), String>,
     ) -> Self {
         // 优先级：命令行 → 配置项 `config_dir` → 环境变量；解析不了就当没指定
-        let want = explicit
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var("CAP_CONFIG_DIR")
-                    .ok()
-                    .and_then(|v| paths::resolve_against_exe_dir(&v).ok())
-            });
+        let want = explicit.filter(|p| p.is_absolute()).or_else(|| {
+            std::env::var("CAP_CONFIG_DIR")
+                .ok()
+                .and_then(|v| paths::resolve_against_exe_dir(&v).ok())
+        });
         let preferred = paths::preferred_config_dir();
-        let plan =
-            paths::choose_config_dir(want.as_deref(), preferred, paths::fallback_config_dirs(), probe);
+        let safe_probe = |dir: &Path| {
+            if crate::sys::has_reparse_ancestor(dir) || !crate::cache::is_plain_dir(dir) {
+                return Err(format!(
+                    "配置目录或其父级是符号链接/junction：{}",
+                    dir.display()
+                ));
+            }
+            probe(dir)
+        };
+        let plan = paths::choose_config_dir(
+            want.as_deref(),
+            preferred,
+            paths::fallback_config_dirs(),
+            &safe_probe,
+        );
 
         if plan.chosen.as_os_str().is_empty() {
             // 一个都写不了：不阻塞界面，改用内存配置，只提示一次
@@ -556,7 +635,12 @@ impl ConfigStore {
                 "无法写入任何配置目录（{reason}）；本次运行的设置只保存在内存中，关闭后不会保留。"
             ));
             let path = want.unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
-            return Self { path, writable: false, notice };
+            return Self {
+                path,
+                writable: false,
+                read_only: false,
+                notice,
+            };
         }
 
         let path = plan.chosen.join(CONFIG_FILE);
@@ -568,7 +652,12 @@ impl ConfigStore {
                 plan.chosen.display()
             )
         });
-        Self { path, writable: true, notice }
+        Self {
+            path,
+            writable: true,
+            read_only: false,
+            notice,
+        }
     }
 
     /// 实际使用的配置文件路径（界面可以显示它，方便用户排查）
@@ -581,6 +670,11 @@ impl ConfigStore {
         self.writable
     }
 
+    /// 配置读取失败或超时后，禁止本次运行继续覆盖原文件。
+    pub fn mark_read_only(&mut self) {
+        self.read_only = true;
+    }
+
     /// 读取：文件不存在 → 默认值；文件损坏 → 先尝试 `.bak`，再返回错误。
     ///
     /// **不可写模式绝不读文件**：这时 `path` 只是一个裸文件名（例如 `config.json`），
@@ -589,29 +683,64 @@ impl ConfigStore {
         if !self.writable {
             return Ok(Config::default());
         }
+        // 读取放到后台线程并设总预算：`std::fs::read_to_string` 本身没有超时，
+        // `config_dir` 指到不可达 UNC 时会让启动永久停在第一帧之前。
+        let path = self.path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("cfg-load".into())
+            .spawn(move || {
+                let _ = tx.send(Self::load_blocking(&path));
+            });
+        if let Err(e) = spawned {
+            return Err(AppError::Config(format!(
+                "无法启动配置读取线程：{e}（{}）",
+                self.path.display()
+            )));
+        }
+        match rx.recv_timeout(CONFIG_READ_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => Err(AppError::Config(format!(
+                "读取配置超时（超过 {} 秒）：{}",
+                CONFIG_READ_TIMEOUT.as_secs(),
+                self.path.display()
+            ))),
+        }
+    }
+
+    /// 实际的文件读取（在 `cfg-load` 线程里执行；不直接暴露给启动路径）。
+    fn load_blocking(path: &Path) -> Result<Config> {
         // 主文件不存在但 `.bak` 还在（用户误删/替换失败）：优先恢复备份。
-        if !self.path.is_file() {
-            let bak = self.path.with_extension("json.bak");
+        if !path.is_file() {
+            let bak = path.with_extension("json.bak");
             if bak.is_file() {
-                if let Ok(c) = Config::load_from(&bak) {
-                    tracing::warn!(bak = %bak.display(), "主配置不存在，已从 .bak 恢复");
-                    return Ok(c);
+                match Config::load_from(&bak) {
+                    Ok(c) => {
+                        tracing::warn!(bak = %bak.display(), "主配置不存在，已从 .bak 恢复");
+                        return Ok(c);
+                    }
+                    Err(e) => {
+                        return Err(AppError::Config(format!(
+                            "主配置不存在，备份 {} 也无法读取：{e}",
+                            bak.display()
+                        )));
+                    }
                 }
             }
             return Ok(Config::default());
         }
-        match Config::load_from(&self.path) {
+        match Config::load_from(path) {
             Ok(c) => Ok(c),
             Err(primary) => {
                 // 主文件损坏时给 `.bak` 一次机会；bak 也不可用就把原始错误报上去。
-                let bak = self.path.with_extension("json.bak");
+                let bak = path.with_extension("json.bak");
                 if !bak.is_file() {
                     return Err(primary);
                 }
                 match Config::load_from(&bak) {
                     Ok(c) => {
                         tracing::warn!(
-                            path = %self.path.display(),
+                            path = %path.display(),
                             bak = %bak.display(),
                             "主配置损坏，已从 .bak 恢复"
                         );
@@ -625,6 +754,12 @@ impl ConfigStore {
 
     /// 保存到已选定的目录（目录可用性在 `detect` 时已确认，不再每次 probe）。
     pub fn save(&self, cfg: &Config) -> Result<()> {
+        if self.read_only {
+            return Err(AppError::Config(format!(
+                "配置读取失败，本次运行处于只读模式，不覆盖原文件：{}",
+                self.path.display()
+            )));
+        }
         if !self.writable {
             return Err(AppError::Config(format!(
                 "配置目录不可写：{}",
@@ -695,7 +830,39 @@ mod tests {
 
         std::fs::remove_file(&bak).unwrap();
         std::fs::write(store.path(), b"{ not json").unwrap();
-        assert!(store.load().is_err(), "没有 bak 时损坏必须报错，不能静默 default");
+        assert!(
+            store.load().is_err(),
+            "没有 bak 时损坏必须报错，不能静默 default"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_store_refuses_to_overwrite_after_load_failure() {
+        let dir = std::env::temp_dir().join(format!("cap-cfg-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = ConfigStore::detect(Some(dir.clone()));
+        let path = store.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"fps\":60}").unwrap();
+        store.mark_read_only();
+        assert!(store.save(&Config::default()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"fps\":60}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_primary_with_corrupt_backup_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "cap-cfg-bad-bak-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = ConfigStore::detect(Some(dir.clone()));
+        let primary = store.path().to_path_buf();
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        std::fs::write(primary.with_extension("json.bak"), b"{ broken").unwrap();
+        assert!(store.load().is_err(), "损坏的备份不能被静默当成默认配置");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -722,7 +889,10 @@ mod tests {
     fn p42_dark_mode_defaults_to_true_for_old_configs() {
         // 老配置：既没有 dark_mode，也没有本轮新增的任何键
         let cfg: Config = serde_json::from_str(r#"{"fps": 60, "language": "zh-CN"}"#).unwrap();
-        assert!(cfg.dark_mode, "老配置没写 dark_mode → 必须是深色（P42 默认翻转）");
+        assert!(
+            cfg.dark_mode,
+            "老配置没写 dark_mode → 必须是深色（P42 默认翻转）"
+        );
         // 空对象（连 fps 都没有）同样
         let empty: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert!(empty.dark_mode);
@@ -766,7 +936,11 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"language": "zh-CN"}"#).unwrap();
         assert_eq!(cfg.clone().sanitized().language, "zh-CN");
         // 空/缺失 → 回填默认
-        let blank = Config { language: String::new(), ..Config::default() }.sanitized();
+        let blank = Config {
+            language: String::new(),
+            ..Config::default()
+        }
+        .sanitized();
         assert_eq!(blank.language, "en-US");
         let missing: Config = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(missing.sanitized().language, "en-US");
@@ -776,7 +950,11 @@ mod tests {
     #[test]
     fn audio_bitrate_and_keyframe_interval_are_normalized() {
         for input in [0u32, 32, 64, 192, 320, 512, 9_999] {
-            let c = Config { audio_bitrate_kbps: input, ..Config::default() }.sanitized();
+            let c = Config {
+                audio_bitrate_kbps: input,
+                ..Config::default()
+            }
+            .sanitized();
             assert_eq!(
                 c.audio_bitrate_kbps, FIXED_AUDIO_BITRATE_KBPS,
                 "音频码率 {input} 应归一为固定 192 kbps"
@@ -784,8 +962,15 @@ mod tests {
             assert_eq!(c.audio_bitrate_kbps, 192);
         }
         for input in [0u32, 1, 2, 7, 60] {
-            let c = Config { keyframe_interval_sec: input, ..Config::default() }.sanitized();
-            assert_eq!(c.keyframe_interval_sec, 0, "关键帧间隔 {input} 应归一为 0（自动）");
+            let c = Config {
+                keyframe_interval_sec: input,
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(
+                c.keyframe_interval_sec, 0,
+                "关键帧间隔 {input} 应归一为 0（自动）"
+            );
         }
         assert_eq!(Config::default().audio_bitrate_kbps, 192, "默认就是 192");
         assert_eq!(Config::default().keyframe_interval_sec, 0, "默认就是自动");
@@ -796,7 +981,12 @@ mod tests {
         let cfg = Config {
             fps: 100_000,
             video_bitrate_kbps: 0,
-            region: Region { x: 0, y: 0, width: 2, height: 2 },
+            region: Region {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
             capture_mode: CaptureMode::Region,
             audio_system: false,
             audio_mic: false,
@@ -805,7 +995,11 @@ mod tests {
         let c = cfg.sanitized();
         assert_eq!(c.fps, 60);
         assert_eq!(c.video_bitrate_kbps, 5_000, "码率下限 5 Mbps");
-        assert_eq!(c.capture_mode, CaptureMode::FullScreen, "非法区域应退回全屏");
+        assert_eq!(
+            c.capture_mode,
+            CaptureMode::FullScreen,
+            "非法区域应退回全屏"
+        );
         assert!(c.audio_system, "音源全空时应至少开启系统声音");
     }
 
@@ -838,7 +1032,10 @@ mod tests {
             ..Config::default()
         }
         .sanitized();
-        assert!(c.audio_system, "画面+声音模式下音源全关也必须归一为系统声音");
+        assert!(
+            c.audio_system,
+            "画面+声音模式下音源全关也必须归一为系统声音"
+        );
 
         // ③ **只关系统声音、开着麦克风**时不该被"归一"打扰（用户明确只录麦克风）
         let c = Config {
@@ -859,8 +1056,17 @@ mod tests {
     /// 目标码率滑尺区间（5–20 Mbps，默认 5）与"外部没有的选项一律归一"。
     #[test]
     fn video_bitrate_is_clamped_to_five_twenty_mbps() {
-        for (input, want) in [(4_000u32, 5_000u32), (25_000, 20_000), (14_000, 14_000), (0, 5_000)] {
-            let c = Config { video_bitrate_kbps: input, ..Config::default() }.sanitized();
+        for (input, want) in [
+            (4_000u32, 5_000u32),
+            (25_000, 20_000),
+            (14_000, 14_000),
+            (0, 5_000),
+        ] {
+            let c = Config {
+                video_bitrate_kbps: input,
+                ..Config::default()
+            }
+            .sanitized();
             assert_eq!(c.video_bitrate_kbps, want, "{input} kbps 应夹到 {want}");
         }
         // 默认值就是 5 Mbps，且处在区间内
@@ -889,7 +1095,10 @@ mod tests {
         assert!(!cfg.prefer_cabac, "熵编码只剩 prefer_cabac 这一个入口");
         // 关键：`entropy: "Cavlc"` 这种"看起来该生效"的镜像值不会再被读到，
         // 真正决定码流的是 prefer_cabac（这里显式给了 false，语义一致）。
-        assert!(!cfg.sanitized().prefer_cabac, "sanitized() 不该动 prefer_cabac");
+        assert!(
+            !cfg.sanitized().prefer_cabac,
+            "sanitized() 不该动 prefer_cabac"
+        );
     }
 
     #[test]
@@ -909,7 +1118,11 @@ mod tests {
             (100_000, 60),
         ] {
             assert_eq!(nearest_fps(input), want, "nearest_fps({input}) 应为 {want}");
-            let cfg = Config { fps: input, ..Config::default() }.sanitized();
+            let cfg = Config {
+                fps: input,
+                ..Config::default()
+            }
+            .sanitized();
             assert_eq!(cfg.fps, want, "fps={input} 经 sanitized() 后应为 {want}");
         }
         // 两档原样保留，且默认值就是 30
@@ -921,7 +1134,12 @@ mod tests {
 
     #[test]
     fn region_even_and_bounds() {
-        let r = Region { x: -1920, y: -100, width: 1921, height: 1081 };
+        let r = Region {
+            x: -1920,
+            y: -100,
+            width: 1921,
+            height: 1081,
+        };
         assert_eq!(r.right(), 1);
         assert_eq!(r.bottom(), 981);
         let e = r.even();
@@ -938,7 +1156,10 @@ mod tests {
         assert_eq!(back.region, cfg.region);
         assert_eq!(back.config_dir, cfg.config_dir);
         // 托盘 / 全局快捷键四项也要能原样往返
-        assert_eq!(back.hide_to_tray_on_record_start, cfg.hide_to_tray_on_record_start);
+        assert_eq!(
+            back.hide_to_tray_on_record_start,
+            cfg.hide_to_tray_on_record_start
+        );
         assert_eq!(back.global_hotkey_enabled, cfg.global_hotkey_enabled);
         assert_eq!(back.hotkey_preset, cfg.hotkey_preset);
         assert_eq!(back.hotkey_custom, cfg.hotkey_custom);
@@ -1117,30 +1338,58 @@ mod tests {
     fn empty_or_relative_output_dir_is_never_left_relative() {
         // 手改配置成空目录/相对路径时：sanitized() 必须给回一个绝对路径，
         // 否则双击 exe（CWD=System32）会把录制文件写到系统目录里
-        let c = Config { output_dir: "  ".into(), ..Config::default() }.sanitized();
+        let c = Config {
+            output_dir: "  ".into(),
+            ..Config::default()
+        }
+        .sanitized();
         assert!(!c.output_dir.trim().is_empty(), "空目录应回落到默认位置");
-        assert!(PathBuf::from(&c.output_dir).is_absolute(), "{}", c.output_dir);
+        assert!(
+            PathBuf::from(&c.output_dir).is_absolute(),
+            "{}",
+            c.output_dir
+        );
 
-        let c = Config { output_dir: "cap-out".into(), ..Config::default() }.sanitized();
-        assert!(PathBuf::from(&c.output_dir).is_absolute(), "{}", c.output_dir);
+        let c = Config {
+            output_dir: "cap-out".into(),
+            ..Config::default()
+        }
+        .sanitized();
+        assert!(
+            PathBuf::from(&c.output_dir).is_absolute(),
+            "{}",
+            c.output_dir
+        );
         assert!(c.output_dir.ends_with("cap-out"), "{}", c.output_dir);
     }
 
     #[test]
     fn explicit_config_dir_must_be_absolute_or_none() {
         // 配置项 config_dir 缺失/空白 → None（走默认首选目录）
-        let c = Config { config_dir: None, ..Config::default() };
+        let c = Config {
+            config_dir: None,
+            ..Config::default()
+        };
         assert!(c.explicit_config_dir().is_none());
-        let c = Config { config_dir: Some("   ".into()), ..Config::default() };
+        let c = Config {
+            config_dir: Some("   ".into()),
+            ..Config::default()
+        };
         assert!(c.explicit_config_dir().is_none(), "空白项不能被当成目录");
 
         // 绝对路径原样返回；相对路径以 exe 目录为基准解析成绝对路径
-        let c = Config { config_dir: Some(r"C:\Users\Limit li\Documents\cap".into()), ..Config::default() };
+        let c = Config {
+            config_dir: Some(r"C:\Users\Limit li\Documents\cap".into()),
+            ..Config::default()
+        };
         assert_eq!(
             c.explicit_config_dir().as_deref(),
             Some(Path::new(r"C:\Users\Limit li\Documents\cap"))
         );
-        let c = Config { config_dir: Some("portable-cfg".into()), ..Config::default() };
+        let c = Config {
+            config_dir: Some("portable-cfg".into()),
+            ..Config::default()
+        };
         let resolved = c.explicit_config_dir().expect("相对路径也应能解析");
         assert!(resolved.is_absolute(), "{}", resolved.display());
         assert!(resolved.ends_with("portable-cfg"));

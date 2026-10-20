@@ -42,7 +42,7 @@
 
 use super::{
     av_err, cpath, limit_decoder_pixels, limit_input_probe, ts_to_ms, Codec, Frame, Input, Packet,
-    AV_NOPTS_VALUE, AVERROR_EOF,
+    AVERROR_EOF, AV_NOPTS_VALUE,
 };
 use crate::error::AppError;
 use ffmpeg_next::ffi as ff;
@@ -321,10 +321,11 @@ pub(super) fn scan_pass(
     vindex: i32,
     tb: ff::AVRational,
     video_dur_ms: i64,
-) -> ScanPass {
+    cancel: Option<&AtomicBool>,
+) -> Option<ScanPass> {
     let mut out = ScanPass::default();
     if vindex < 0 {
-        return out;
+        return Some(out);
     }
     let video_dur_ms = video_dur_ms.max(0);
     let mut max_pts_ms: i64 = 0;
@@ -334,7 +335,10 @@ pub(super) fn scan_pass(
         let pkt = Packet(ff::av_packet_alloc());
         if pkt.0.is_null() {
             tracing::warn!("编码体检：av_packet_alloc 失败（本次体检跳过）");
-            return out;
+            return Some(out);
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return None;
         }
         // 回绕到文件头：`find_stream_info` 之后读位置停在半路，不先 seek 就会漏掉开头。
         // seek 失败不致命（最多漏判开头那一小段），但要留一行日志。
@@ -343,6 +347,11 @@ pub(super) fn scan_pass(
             tracing::warn!(error = %av_err(seek), "编码体检：回绕文件头失败，从当前位置开始扫");
         }
         loop {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                // 取消不是"读完了"：绝不能把已扫到的一半当成完整表，
+                // 否则会误报 ShortData/NoKeyframe。调用方直接丢弃本次结果。
+                return None;
+            }
             let ret = ff::av_read_frame(ictx.0, pkt.0);
             if ret < 0 {
                 if ret != AVERROR_EOF {
@@ -415,7 +424,7 @@ pub(super) fn scan_pass(
     }
     out.health.scanned_ms = video_dur_ms.max(max_pts_ms).max(0);
     out.health.merge();
-    out
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +448,12 @@ pub fn deep_scan(
     cancel: &AtomicBool,
     mut progress: impl FnMut(i64),
 ) -> Result<HealthReport, AppError> {
+    if !path.is_file() {
+        return Err(AppError::Mp4(format!(
+            "只支持本地文件：{}",
+            path.display()
+        )));
+    }
     let c_path = cpath(path)?;
     let mut out = HealthReport {
         full_decode: true,
@@ -462,6 +477,7 @@ pub fn deep_scan(
         if ff::avformat_find_stream_info(ictx.0, ptr::null_mut()) < 0 {
             return Err(AppError::Mp4("读取流信息失败".into()));
         }
+        crate::mux::validate_input_streams(ictx.0)?;
 
         // 第一条视频流
         let mut vindex = -1i32;

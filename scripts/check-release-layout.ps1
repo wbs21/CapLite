@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $project = Split-Path -Parent $scriptDir
 if ([string]::IsNullOrWhiteSpace($Root)) {
-    $Root = Join-Path $project 'dist\CapLite-1.0.1'
+    $Root = Join-Path $project 'dist\CapLite-1.0.2'
 }
 $Root = (Resolve-Path -LiteralPath $Root).Path
 

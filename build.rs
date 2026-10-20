@@ -352,8 +352,8 @@ const ICON_RES_ID: &str = "1";
 // ---------------------------------------------------------------------------
 
 /// **产品版本**（展示串）。与 `Cargo.toml` 的 `version` 保持一致；
-/// 四段数字形式由 [`version_quad`] 从它推导（`1.0.0` → `1,0,0,0`）。
-const PRODUCT_VERSION_STR: &str = "1.0.0";
+/// 四段数字形式由 [`version_quad`] 从它推导（`1.0.2` → `1,0,2,0`）。
+const PRODUCT_VERSION_STR: &str = "1.0.2";
 /// 产品名：与 `theme::APP_NAME` 同值（窗口标题与文件属性不该各写一个）。
 const PRODUCT_NAME: &str = "CapLite";
 /// `FileDescription`：资源管理器里"说明"那一栏。

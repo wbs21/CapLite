@@ -17,17 +17,20 @@ use windows::Win32::System::Threading::CreateMutexW;
 /// 互斥体名字。`Local\` 只在本登录会话可见，正好匹配“一台机器上同一用户只开一个”。
 const MUTEX_NAME: windows::core::PCWSTR = w!(r"Local\CapLite.SingleInstance");
 
-/// 是否已经由本进程成功持有互斥体（失败开放：CreateMutexW 本身失败时不阻止启动）。
+/// 是否已经由本进程成功持有互斥体。
 static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 尝试认领单实例。返回 `false` 表示已有实例在运行（调用方应激活它并退出）。
+/// 尝试认领单实例。
 ///
-/// 失败开放：如果连命名互斥体都创建不了（极端权限/内核对象限制），宁可允许启动，
-/// 也不要让用户完全打不开程序。
-pub fn claim() -> bool {
+/// * `Ok(true)`：本进程持有互斥体，可以继续启动；
+/// * `Ok(false)`：已有实例在运行，调用方应激活它并退出；
+/// * `Err(_)`：连互斥体都创建不了（极端权限/内核对象限制）。此时**失败关闭**：
+///   多开会争用配置、Cache、热键和导出文件，数据损坏的代价高于“暂时打不开”，
+///   调用方必须把错误明确告诉用户。
+pub fn claim() -> Result<bool, String> {
     use std::sync::atomic::Ordering;
     if CLAIMED.load(Ordering::Acquire) {
-        return true;
+        return Ok(true);
     }
     // 先清零 last-error，避免把上一个无关 Win32 调用的 ERROR_ALREADY_EXISTS 误当成本次结果。
     unsafe { SetLastError(ERROR_SUCCESS) };
@@ -38,15 +41,15 @@ pub fn claim() -> bool {
             let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
             if already {
                 let _ = unsafe { CloseHandle(handle) };
-                return false;
+                return Ok(false);
             }
             // 成功路径**故意不关闭**：互斥体要活到进程结束。句柄是 Copy 类型、
             // 没有 Drop，直接丢弃即可；进程退出时内核自动回收。
             let _ = handle;
             CLAIMED.store(true, Ordering::Release);
-            true
+            Ok(true)
         }
-        Err(_) => true,
+        Err(e) => Err(format!("创建单实例互斥体失败：{e}")),
     }
 }
 
@@ -64,5 +67,3 @@ pub fn activate_existing() -> bool {
     }
     false
 }
-
-

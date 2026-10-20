@@ -27,7 +27,9 @@ use crate::video::capture::{list_monitors, MonitorEntry};
 use super::theme;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -200,6 +202,11 @@ pub struct MainPage {
     /// 加起来是几十到几百毫秒的**纯等待**，用户看到的是"双击后窗口迟迟不出现"。
     /// 现在改成"窗口先出来，枚举在首帧之后马上补上"，`0` 表示已经执行过（不重复）。
     defer_ticks: u8,
+    /// 延迟预热的最早时刻：启动后先让纯剪辑/查看用户保持低占用，
+    /// 真正准备录制（或过了空闲窗口）再建 OpenH264 实例。
+    prewarm_at: Instant,
+    /// 是否已经触发过首次预热（之后配置变化才立即重建）。
+    prewarm_started: bool,
     /// 启动阶段打点用的日志落点（由外壳注入；`None` = 不记，单测就是这种）
     startup_log: Option<fn(&str)>,
     /// 区域模式下换屏后的提示（"请重新框选"之类）：走外壳底部栏的 warn 通道
@@ -215,6 +222,14 @@ pub struct MainPage {
     error: Option<String>,
     /// 输出目录探测的缓存：上次探测时用的目录值（避免每帧都真写一个临时文件）
     output_probe: Option<String>,
+    /// 防抖中的待探测目录：`(目录值, 最早探测时刻)`。
+    output_probe_pending: Option<(String, Instant)>,
+    /// 输出目录探测的请求代际：目录一变就 +1，旧线程的结果直接丢弃。
+    output_probe_epoch: u64,
+    /// 后台目录探测结果（不阻塞 UI）。
+    output_probe_rx: Option<Receiver<(u64, String)>>,
+    /// 当前探测任务的失效令牌（结果代际之外再加一层，防止旧任务继续跑）。
+    output_probe_cancel: Option<Arc<AtomicBool>>,
     /// 外壳已经解析好的 Cache 根目录；`None` = 还没注入（测试/旧路径）。
     /// 有它之后开始录制不再自己 `ConfigStore::detect(None)`（那会重复探测，
     /// 并且会忽略 `--config-dir`）。
@@ -225,10 +240,14 @@ pub struct MainPage {
     starting: bool,
     start_rx: Option<Receiver<Result<Recorder, AppError>>>,
     start_handle: Option<JoinHandle<()>>,
+    /// 当前启动任务的协作取消令牌。
+    start_cancel: Option<Arc<AtomicBool>>,
     /// 正在后台 join + 导出（`Recorder::stop` 可能几分钟）。
     stopping: bool,
     stop_rx: Option<Receiver<Result<RecordingResult, AppError>>>,
     stop_handle: Option<JoinHandle<()>>,
+    /// 当前收尾任务的协作取消令牌。
+    stop_cancel: Option<Arc<AtomicBool>>,
     /// 看门狗：超过这些时刻就报超时并放弃等待（后台线程可能仍在收尾）。
     start_deadline: Option<Instant>,
     stop_deadline: Option<Instant>,
@@ -268,6 +287,10 @@ pub struct MainPage {
 /// 2 帧在 60Hz 下约 33 ms，用户感知不到"列表晚了一点出来"。
 const DEFER_INIT_FRAMES: u8 = 2;
 
+/// 输出目录输入防抖：用户连续键入路径时只保留最后一次探测，
+/// 避免每个字符都起一个网络/磁盘探测线程。
+const OUTPUT_PROBE_DEBOUNCE: Duration = Duration::from_millis(350);
+
 /// 启动看门狗：正常 0.5–6 s；超过 15 s 认为引擎卡住，UI 不再无限显示 Starting。
 const START_WATCHDOG: Duration = Duration::from_secs(15);
 /// 停止/导出看门狗：长录制 remux 可能较久，但不应无限；超过 2 min 交给用户决定。
@@ -281,6 +304,17 @@ impl Default for MainPage {
     }
 }
 
+impl Drop for MainPage {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.start_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+        if let Some(cancel) = &self.stop_cancel {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl MainPage {
     pub fn new() -> Self {
         Self {
@@ -290,6 +324,8 @@ impl MainPage {
             monitors_loaded: false,
             last_monitor_refresh: Instant::now(),
             defer_ticks: DEFER_INIT_FRAMES,
+            prewarm_at: Instant::now() + Duration::from_secs(8),
+            prewarm_started: false,
             startup_log: None,
             region_hint: None,
             mic_devices: None,
@@ -297,13 +333,19 @@ impl MainPage {
             picker: None,
             error: None,
             output_probe: None,
+            output_probe_pending: None,
+            output_probe_epoch: 0,
+            output_probe_rx: None,
+            output_probe_cancel: None,
             cache_dir: None,
             starting: false,
             start_rx: None,
             start_handle: None,
+            start_cancel: None,
             stopping: false,
             stop_rx: None,
             stop_handle: None,
+            stop_cancel: None,
             start_deadline: None,
             stop_deadline: None,
             watchdog_fired: false,
@@ -365,14 +407,18 @@ impl MainPage {
         let monitors_ms = t0.elapsed().as_millis();
         // 输出目录探测：与 `output_section` 里那套逻辑同一份判断（缓存键置空 → 这次真探测一遍）
         self.output_probe = None;
-        let probed = self.probe_output_dir(cfg, t);
+        let probed = self.probe_output_dir(cfg, t, None);
         // 诊断串**只进日志**（`cap.log`），所以按日志惯例写 ASCII：
         // 它不上界面，也就不该被当成"界面文案"（`ui::i18n_guard` 会拦硬编码中文）。
         let extra = format!(
             "[cap] monitors {} / enum {}ms / output-dir probe {}",
             self.monitors.len(),
             monitors_ms,
-            if probed { "ran" } else { "skipped (cache valid)" }
+            if probed {
+                "ran"
+            } else {
+                "skipped (cache valid)"
+            }
         );
         startup_marks::mark_dur_extra_log(log, "deferred_enum_done", "app", t0.elapsed(), extra);
         // 麦克风：只有"这次录制真的要麦克风"或用户展开下拉时才枚举（保持改动前语义）。
@@ -387,6 +433,8 @@ impl MainPage {
         self.poll_recording_jobs(cx.cfg, cx.recorder, cx.result, i18n);
         // 只捕获 &I18n（Copy），这样下面借用 cfg 时不会打架
         let t = |k: &str| i18n.t(k).to_string();
+        // 目录可写性探测在后台线程里跑；这里只收结果，绝不在绘制路径上碰网络盘。
+        self.poll_output_probe(ui.ctx(), &t);
 
         // ---- 逐部件高度探针：每帧清零后重记（见 [`RecordProbe`]）----
         // 页面级几何（可用宽度/高度、可用区顶边）先落下来，卡片几何在下面逐个填。
@@ -448,73 +496,74 @@ impl MainPage {
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-            // 滚动区**内容**的顶边（页面可用区顶 → 内容顶 = 首留白，见 `lead_blank_h`）
-            #[cfg(test)]
-            {
-                probe.content_top = ui.min_rect().top();
-            }
-            // 顶部**状态卡片**：状态点 + 状态文字 + 大号等宽时长 + 主操作按钮（同一行）
-            // + 按钮左侧的分辨率信息（P38 从采集卡挪来）
-            record_action = self.status_card(ui, cx.recorder, cx.result, cx.cfg, i18n, &t, &mut probe);
-            // 卡片间距也用**紧凑**那一档（`GAP_CARD_TIGHT`）：这一页的高度直接决定
-            // 程序最小窗口高度（见 `ui::layout`），4 张卡片之间共省 12px。
-            ui.add_space(theme::GAP_CARD_TIGHT);
-            // ---- 录制中：参数控件全部置灰 ----
-            // 本次录制的参数在 `Recorder::start` 里就**快照**好了：帧率、导出目录等都是那时的
-            // 局部变量，编码器/封装器也已经建好并持有这些值，
-            // 中途改配置不会影响正在进行的这一次；所以录制期间直接禁用参数控件，
-            // 并给一行说明，避免用户以为"改了没生效是 bug"。
-            // 停止按钮在**状态卡片**里（不在这个 `add_enabled_ui` 作用域内），所以始终可用。
-            let recording = cx.recorder.is_some();
-            if recording {
-                ui.label(
-                    egui::RichText::new(t("recording_locked"))
-                        .size(theme::FS_SMALL)
-                        .color(theme::warn_fg()),
-                );
-                ui.add_space(theme::GAP_ROW_TIGHT);
-            }
-            ui.add_enabled_ui(!recording, |ui| {
-                // `card` 只在测试构建里被读（逐部件高度探针）；发布构建编译时"未使用"是预期的
-                #[cfg_attr(not(test), allow(unused_variables))]
-                let (_, card) = theme::card_tight(ui, |ui| {
-                    out.cfg_changed |= self.capture_section(ui, cx.cfg, &t, &mut probe);
-                });
+                // 滚动区**内容**的顶边（页面可用区顶 → 内容顶 = 首留白，见 `lead_blank_h`）
                 #[cfg(test)]
                 {
-                    probe.capture_card_h = card.outer_h;
-                    probe.capture_card_inner_h = card.inner_h;
+                    probe.content_top = ui.min_rect().top();
                 }
+                // 顶部**状态卡片**：状态点 + 状态文字 + 大号等宽时长 + 主操作按钮（同一行）
+                // + 按钮左侧的分辨率信息（P38 从采集卡挪来）
+                record_action =
+                    self.status_card(ui, cx.recorder, cx.result, cx.cfg, i18n, &t, &mut probe);
+                // 卡片间距也用**紧凑**那一档（`GAP_CARD_TIGHT`）：这一页的高度直接决定
+                // 程序最小窗口高度（见 `ui::layout`），4 张卡片之间共省 12px。
                 ui.add_space(theme::GAP_CARD_TIGHT);
-                #[cfg_attr(not(test), allow(unused_variables))]
-                let (_, card) = theme::card_tight(ui, |ui| {
-                    out.cfg_changed |= self.content_section(ui, cx.cfg, &t, &mut probe);
-                });
-                #[cfg(test)]
-                {
-                    probe.content_card_h = card.outer_h;
-                    probe.content_card_inner_h = card.inner_h;
+                // ---- 录制中：参数控件全部置灰 ----
+                // 本次录制的参数在 `Recorder::start` 里就**快照**好了：帧率、导出目录等都是那时的
+                // 局部变量，编码器/封装器也已经建好并持有这些值，
+                // 中途改配置不会影响正在进行的这一次；所以录制期间直接禁用参数控件，
+                // 并给一行说明，避免用户以为"改了没生效是 bug"。
+                // 停止按钮在**状态卡片**里（不在这个 `add_enabled_ui` 作用域内），所以始终可用。
+                let recording = cx.recorder.is_some();
+                if recording {
+                    ui.label(
+                        egui::RichText::new(t("recording_locked"))
+                            .size(theme::FS_SMALL)
+                            .color(theme::warn_fg()),
+                    );
+                    ui.add_space(theme::GAP_ROW_TIGHT);
                 }
+                ui.add_enabled_ui(!recording, |ui| {
+                    // `card` 只在测试构建里被读（逐部件高度探针）；发布构建编译时"未使用"是预期的
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let (_, card) = theme::card_tight(ui, |ui| {
+                        out.cfg_changed |= self.capture_section(ui, cx.cfg, &t, &mut probe);
+                    });
+                    #[cfg(test)]
+                    {
+                        probe.capture_card_h = card.outer_h;
+                        probe.capture_card_inner_h = card.inner_h;
+                    }
+                    ui.add_space(theme::GAP_CARD_TIGHT);
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let (_, card) = theme::card_tight(ui, |ui| {
+                        out.cfg_changed |= self.content_section(ui, cx.cfg, &t, &mut probe);
+                    });
+                    #[cfg(test)]
+                    {
+                        probe.content_card_h = card.outer_h;
+                        probe.content_card_inner_h = card.inner_h;
+                    }
+                    ui.add_space(theme::GAP_CARD_TIGHT);
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    let (_, card) = theme::card_tight(ui, |ui| {
+                        out.cfg_changed |= self.output_section(ui, cx.cfg, &t, &mut probe);
+                    });
+                    #[cfg(test)]
+                    {
+                        probe.output_card_h = card.outer_h;
+                        probe.output_card_inner_h = card.inner_h;
+                    }
+                });
                 ui.add_space(theme::GAP_CARD_TIGHT);
-                #[cfg_attr(not(test), allow(unused_variables))]
-                let (_, card) = theme::card_tight(ui, |ui| {
-                    out.cfg_changed |= self.output_section(ui, cx.cfg, &t, &mut probe);
-                });
-                #[cfg(test)]
-                {
-                    probe.output_card_h = card.outer_h;
-                    probe.output_card_inner_h = card.inner_h;
+                if let Some(path) = self.result_card(ui, cx.result, &t) {
+                    out.open_in_editor = Some(path.0);
+                    out.open_in_editor_fallback = path.1;
                 }
+                // 滚动区**内容**的底边：不在这里量 —— `auto_shrink([false, false])` 下滚动区的
+                // `ui` 按**视口**高度扩张，且 `add_space` 会把 `min_rect` 重复撑大。
+                // 真口径由各张卡片的实测高度 + 间距 + 恒定差额在帧末拼出（见 `ui()` 的帧末段）。
             });
-            ui.add_space(theme::GAP_CARD_TIGHT);
-            if let Some(path) = self.result_card(ui, cx.result, &t) {
-                out.open_in_editor = Some(path.0);
-                out.open_in_editor_fallback = path.1;
-            }
-            // 滚动区**内容**的底边：不在这里量 —— `auto_shrink([false, false])` 下滚动区的
-            // `ui` 按**视口**高度扩张，且 `add_space` 会把 `min_rect` 重复撑大。
-            // 真口径由各张卡片的实测高度 + 间距 + 恒定差额在帧末拼出（见 `ui()` 的帧末段）。
-        });
         // 本帧布局测量（最小窗口高度 `ui::layout::MIN_INNER_H` 的推导数据源）
         self.probe = LayoutProbe {
             content_h: _scroll.content_size.y,
@@ -596,21 +645,28 @@ impl MainPage {
         // 每帧调用是安全的：内部一次性标志，只有第一次真的起线程；失败只进 `cap.log`。
         if self.defer_ticks == 0 && self.audio_enum_attempted() {
             startup_marks::preload_ffmpeg_dlls_once(self.startup_log);
-            // ---- OpenH264 编码器预热：**同一个时机**（枚举完成 + 首帧之后）----
+            // ---- OpenH264 编码器预热：枚举完成后再等一个空闲窗口 ----
             //
             // 为什么在这里：`Recorder::start` 里 `Capture::open` + `OpenH264 初始化` 是
             // "按下开始录制后一帧画面都没有"的那几秒，实测编码器初始化占 0.46~6.0 s。
-            // 这里在**后台线程**按当前配置把它建好（`video::encode::prewarm_encoder_async`），
-            // 录制时按缓存键**取走**复用 —— 键不匹配/没有/失败就照旧同步初始化。
-            // 不阻塞 UI 帧（线程 + 一次性认领），也**不是**正确性前提（失败只进日志）。
-            if cx.recorder.is_none() {
+            // 启动 8 s 后仍在录制页、且用户没有开始录制，再在**后台线程**按当前配置
+            // 建好实例。这样只剪辑/查看的用户不必为编码器常驻约 25 MB 工作集；
+            // 真按下开始时仍按缓存键取用，键不匹配/没有/失败就照旧同步初始化。
+            if cx.recorder.is_none() && !self.prewarm_started && Instant::now() >= self.prewarm_at {
                 startup_marks::prewarm_encoder_once(cx.cfg, self.startup_log);
+                self.prewarm_started = true;
+            } else if !self.prewarm_started {
+                // 没有输入时 egui 不出帧：给预热时刻排一次唤醒。
+                ui.ctx().request_repaint_after(
+                    self.prewarm_at.saturating_duration_since(Instant::now()),
+                );
             }
         }
         // ---- 配置改了（分辨率/帧率/码率/区域…）→ 缓存键变了就重新后台预热 ----
         // 键没变时 `prewarm_encoder_once` 是空操作（一次互斥锁 + 一次 `GetMonitorInfoW`）。
         // 录制中不预热：本次录制的参数在 `Recorder::start` 里就快照好了，再建实例没有意义。
-        if out.cfg_changed && self.defer_ticks == 0 && cx.recorder.is_none() {
+        if out.cfg_changed && self.defer_ticks == 0 && self.prewarm_started && cx.recorder.is_none()
+        {
             startup_marks::prewarm_encoder_once(cx.cfg, self.startup_log);
         }
         out
@@ -659,15 +715,17 @@ impl MainPage {
         // 上限 759 —— 有余量；真账由 `record_page_capture_and_audio_rows_fit`
         // 两种语言各断言一次（拿最后一个控件右缘量的，实测 zh 607 / en 726）。
         const MONITOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
-        if self.monitors_loaded
-            && self.last_monitor_refresh.elapsed() >= MONITOR_REFRESH
-        {
+        if self.monitors_loaded && self.last_monitor_refresh.elapsed() >= MONITOR_REFRESH {
             self.last_monitor_refresh = Instant::now();
             self.refresh_monitors();
         }
         let mut rank = rank_of_cfg(cfg.monitor_index);
         if rank >= self.geo.len() {
-            rank = if self.geo.is_empty() { 0 } else { self.geo.len() - 1 };
+            rank = if self.geo.is_empty() {
+                0
+            } else {
+                self.geo.len() - 1
+            };
         }
         let mut monitor_picked = false;
         // 下拉是否**本帧真的展开**了（`show_ui` 内层闭包只有在展开时才执行）
@@ -805,15 +863,10 @@ impl MainPage {
             region.x as i64 + region.width as i64 / 2,
             region.y as i64 + region.height as i64 / 2,
         );
-        if let Some((rank, _)) = self
-            .geo
-            .iter()
-            .enumerate()
-            .find(|(_, m)| {
-                let (l, t, r, b) = m.bounds();
-                cx >= l && cx < r && cy >= t && cy < b
-            })
-        {
+        if let Some((rank, _)) = self.geo.iter().enumerate().find(|(_, m)| {
+            let (l, t, r, b) = m.bounds();
+            cx >= l && cx < r && cy >= t && cy < b
+        }) {
             cfg.monitor_index = cfg_of_rank(rank);
         }
     }
@@ -847,18 +900,32 @@ impl MainPage {
                     .halign(egui::Align::LEFT),
             );
             changed |= ui
-                .radio_value(&mut cfg.content_mode, ContentMode::VideoAndAudio, t("rmode_both"))
+                .radio_value(
+                    &mut cfg.content_mode,
+                    ContentMode::VideoAndAudio,
+                    t("rmode_both"),
+                )
                 .changed();
             changed |= ui
-                .radio_value(&mut cfg.content_mode, ContentMode::VideoOnly, t("rmode_video"))
+                .radio_value(
+                    &mut cfg.content_mode,
+                    ContentMode::VideoOnly,
+                    t("rmode_video"),
+                )
                 .changed();
             changed |= ui
-                .radio_value(&mut cfg.content_mode, ContentMode::AudioOnly, t("rmode_audio"))
+                .radio_value(
+                    &mut cfg.content_mode,
+                    ContentMode::AudioOnly,
+                    t("rmode_audio"),
+                )
                 .changed();
             // 与内容模式同排：只录声音时置灰（没有画面可画指针），但**位置稳定**
             ui.add_space(14.0);
             ui.add_enabled_ui(video_on, |ui| {
-                changed |= ui.checkbox(&mut cfg.draw_cursor, t("draw_cursor")).changed();
+                changed |= ui
+                    .checkbox(&mut cfg.draw_cursor, t("draw_cursor"))
+                    .changed();
             });
         });
         #[cfg(test)]
@@ -941,7 +1008,12 @@ impl MainPage {
     }
 
     /// 麦克风下拉：None = 系统默认设备
-    fn mic_combo(&mut self, ui: &mut egui::Ui, cfg: &mut Config, t: &dyn Fn(&str) -> String) -> bool {
+    fn mic_combo(
+        &mut self,
+        ui: &mut egui::Ui,
+        cfg: &mut Config,
+        t: &dyn Fn(&str) -> String,
+    ) -> bool {
         if self.mic_devices.is_none() && self.mic_err.is_none() && self.defer_ticks == 0 {
             // 首次枚举麦克风（WASAPI）：**同样延后到首帧之后**（`defer_ticks` 归零才做），
             // 并记一条阶段打点（枚举耗时是"启动路径上要不要推迟它"的依据）。
@@ -1037,7 +1109,7 @@ impl MainPage {
         // 这里只做"提示"：真正的回退在启动时由 plan_output_dir 决定，界面如实显示结论，
         // 用户就能一眼看到"我以为在用的目录"和"实际写入的目录"是否一致。
         // 探测要真写一个临时文件，所以按目录值缓存结果，避免每帧都打一次磁盘。
-        self.probe_output_dir(cfg, t);
+        self.probe_output_dir(cfg, t, Some(ui.ctx()));
         if let Some(note) = self.output_dir_note.as_ref().filter(|n| !n.is_empty()) {
             ui.add_space(theme::GAP_ROW_TIGHT);
             theme::banner(ui, theme::Banner::Warn, note);
@@ -1052,32 +1124,145 @@ impl MainPage {
     ///
     /// 按 `cfg.output_dir` 的值缓存：值没变就不重复探测（每帧都真写一次文件是不可接受的）。
     /// 返回本次是否真的探测过。
-    fn probe_output_dir(&mut self, cfg: &Config, t: &dyn Fn(&str) -> String) -> bool {
-        if self.output_probe.as_deref() == Some(cfg.output_dir.trim()) {
+    fn probe_output_dir(
+        &mut self,
+        cfg: &Config,
+        t: &dyn Fn(&str) -> String,
+        ctx: Option<&egui::Context>,
+    ) -> bool {
+        let key = cfg.output_dir.trim().to_string();
+        if self.output_probe.as_deref() == Some(key.as_str()) {
+            self.output_probe_pending = None;
             return false;
         }
-        let resolved = crate::config::resolve_against_exe_dir(&cfg.output_dir);
-        self.output_dir_note = Some(match &resolved {
-            Err(e) => format!("{}: {e}", t("storage_dir")),
-            Ok(dir) => {
-                let plan = crate::config::plan_output_dir(
-                    &dir.to_string_lossy(),
-                    &crate::config::probe_dir_writable,
-                );
-                // 全部不可写 → 显示详细错误；发生回退 → "已改用 X"；否则不打扰用户
-                if let Some(chosen) = plan.chosen_path() {
-                    if plan.fell_back() {
-                        format!("{} {}", t("warn_fallback_to"), chosen.display())
-                    } else {
-                        String::new()
+        let now = Instant::now();
+        if let Some((pending, due)) = &self.output_probe_pending {
+            if pending == &key && now < *due {
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint_after(due.saturating_duration_since(now));
+                }
+                return false;
+            }
+            if pending != &key {
+                // 用户还在连续输入：作废旧请求，等输入停下来再做一次。
+                if let Some(cancel) = self.output_probe_cancel.take() {
+                    cancel.store(true, Ordering::Release);
+                }
+                self.output_probe_rx = None;
+                self.output_probe_epoch = self.output_probe_epoch.wrapping_add(1);
+                self.output_probe_pending = Some((key, now + OUTPUT_PROBE_DEBOUNCE));
+                self.output_dir_note = None;
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint_after(OUTPUT_PROBE_DEBOUNCE);
+                }
+                return false;
+            }
+        } else {
+            // 新目录：先作废旧任务，再进入防抖窗口。
+            if let Some(cancel) = self.output_probe_cancel.take() {
+                cancel.store(true, Ordering::Release);
+            }
+            self.output_probe = None;
+            self.output_probe_rx = None;
+            self.output_probe_epoch = self.output_probe_epoch.wrapping_add(1);
+            self.output_probe_pending = Some((key, now + OUTPUT_PROBE_DEBOUNCE));
+            self.output_dir_note = None;
+            if let Some(ctx) = ctx {
+                ctx.request_repaint_after(OUTPUT_PROBE_DEBOUNCE);
+            }
+            return false;
+        }
+
+        self.output_probe = Some(key.clone());
+        self.output_probe_pending = None;
+        self.output_dir_note = None;
+        self.output_probe_epoch = self.output_probe_epoch.wrapping_add(1);
+        let epoch = self.output_probe_epoch;
+        let configured = key;
+        let storage = t("storage_dir");
+        let fallback = t("warn_fallback_to");
+        let no_dir = t("err_no_output_dir");
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        self.output_probe_cancel = Some(cancel);
+        let spawned = std::thread::Builder::new()
+            .name("output-dir-probe".into())
+            .spawn(move || {
+                if cancel_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                let note = match crate::config::resolve_against_exe_dir(&configured) {
+                    Err(e) => format!("{storage}: {e}"),
+                    Ok(dir) => {
+                        // 每个候选目录都带 1.5 s 超时；线程本身也跑在 UI 之外，
+                        // 即使驱动层卡住也不会冻结窗口。
+                        let plan = crate::config::plan_output_dir(
+                            &dir.to_string_lossy(),
+                            &crate::config::probe_dir_writable_timeout,
+                        );
+                        if let Some(chosen) = plan.chosen_path() {
+                            if plan.fell_back() {
+                                format!("{fallback} {}", chosen.display())
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            plan.error.unwrap_or(no_dir)
+                        }
                     }
-                } else {
-                    plan.error.unwrap_or_else(|| t("err_no_output_dir"))
+                };
+                if !cancel_thread.load(Ordering::Relaxed) {
+                    let _ = tx.send((epoch, note));
+                }
+            });
+        match spawned {
+            Ok(_) => self.output_probe_rx = Some(rx),
+            Err(e) => {
+                self.output_probe_cancel = None;
+                self.output_dir_note = Some(format!("{}: {e}", t("storage_dir")));
+            }
+        }
+        true
+    }
+
+    /// 收后台目录探测结果（非阻塞）。旧代际结果直接丢弃，避免快速改目录时
+    /// 一个慢返回把新目录的提示盖掉。
+    fn poll_output_probe(&mut self, ctx: &egui::Context, t: &dyn Fn(&str) -> String) {
+        if self
+            .output_probe_cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            self.output_probe_rx = None;
+            self.output_probe_cancel = None;
+            return;
+        }
+        let msg = match self.output_probe_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match msg {
+            Ok((epoch, note)) => {
+                self.output_probe_rx = None;
+                self.output_probe_cancel = None;
+                if epoch == self.output_probe_epoch {
+                    self.output_dir_note = Some(note);
+                }
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.output_probe_rx = None;
+                self.output_probe_cancel = None;
+                // worker 崩了：保留当前缓存键，避免每帧重新起线程；用户改目录会重新探测。
+                if self.output_dir_note.is_none() {
+                    self.output_dir_note = Some(t("err_no_output_dir").to_string());
                 }
             }
-        });
-        self.output_probe = Some(cfg.output_dir.trim().to_string());
-        true
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1097,7 +1282,8 @@ impl MainPage {
         result: &mut Option<RecordingResult>,
         i18n: &I18n,
     ) -> Option<String> {
-        if self.starting || self.stopping || recorder.is_some() {
+        self.reap_finished_jobs();
+        if self.starting || self.stopping || recorder.is_some() || self.jobs_still_running() {
             self.error = Some(i18n.t("err_recording_busy").to_string());
             return self.error.clone();
         }
@@ -1120,17 +1306,20 @@ impl MainPage {
         //（忙机 0.46–6 s）、开 WASAPI；这几秒窗口会“未响应”，托盘/热键也一起失效。
         // 这里只起线程，结果由 `poll_recording_jobs` 在后续帧收。
         let cfg_thread = cfg.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
         let (tx, rx) = channel();
         let spawned = std::thread::Builder::new()
             .name("cap-start".into())
             .spawn(move || {
-                let r = Recorder::start(&cfg_thread, &streaming);
+                let r = Recorder::start_cancellable(&cfg_thread, &streaming, cancel_thread);
                 let _ = tx.send(r);
             });
         match spawned {
             Ok(h) => {
                 self.start_rx = Some(rx);
                 self.start_handle = Some(h);
+                self.start_cancel = Some(cancel);
                 self.starting = true;
                 self.start_deadline = Some(Instant::now() + START_WATCHDOG);
                 *result = None;
@@ -1167,6 +1356,7 @@ impl MainPage {
             return self.error.clone();
         };
         let _ = cfg; // 预热在结果回来后做；此处留着参数是为了调用点签名不变
+        self.stop_cancel = Some(r.cancel_token());
         let (tx, rx) = channel();
         let spawned = std::thread::Builder::new()
             .name("cap-stop".into())
@@ -1189,6 +1379,7 @@ impl MainPage {
                 self.stopping = false;
                 self.stop_rx = None;
                 self.stop_handle = None;
+                self.stop_cancel = None;
                 self.error = Some(i18n.tf("err_stop_failed", &[&e.to_string()]));
                 self.error.clone()
             }
@@ -1198,6 +1389,28 @@ impl MainPage {
     /// 本页是否正在做“开始/停止”的耗时工作（UI 只显示进度，不阻塞）。
     pub fn is_busy(&self) -> bool {
         self.starting || self.stopping
+    }
+
+    fn jobs_still_running(&self) -> bool {
+        self.start_handle.as_ref().is_some_and(|h| !h.is_finished())
+            || self.stop_handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// 回收已经结束的后台句柄；看门狗超时后句柄会保留到这里，避免旧任务未退出时
+    /// UI 又启动第二个录制会话。
+    fn reap_finished_jobs(&mut self) {
+        if self.start_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.start_handle.take() {
+                let _ = h.join();
+            }
+            self.start_cancel = None;
+        }
+        if self.stop_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.stop_handle.take() {
+                let _ = h.join();
+            }
+            self.stop_cancel = None;
+        }
     }
 
     /// 请求“当前收尾完成后关闭窗口”（托盘 Quit / 用户点 X）。
@@ -1226,13 +1439,14 @@ impl MainPage {
         result: &mut Option<RecordingResult>,
         i18n: &I18n,
     ) {
+        self.reap_finished_jobs();
         if let Some(rx) = self.start_rx.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(r)) => {
                     self.starting = false;
                     self.start_rx = None;
-                    self.start_handle = None; // detach；线程已经发完结果
                     self.start_deadline = None;
+                    self.start_cancel = None;
                     self.log_start_phases(&r);
                     *recorder = Some(r);
                     *result = None;
@@ -1240,8 +1454,8 @@ impl MainPage {
                 Ok(Err(e)) => {
                     self.starting = false;
                     self.start_rx = None;
-                    self.start_handle = None;
                     self.start_deadline = None;
+                    self.start_cancel = None;
                     self.stop_after_start = false;
                     self.error = Some(i18n.tf("err_start_failed", &[&e.to_string()]));
                 }
@@ -1249,8 +1463,8 @@ impl MainPage {
                 Err(TryRecvError::Disconnected) => {
                     self.starting = false;
                     self.start_rx = None;
-                    self.start_handle = None;
                     self.start_deadline = None;
+                    self.start_cancel = None;
                     self.stop_after_start = false;
                     self.error = Some(i18n.tf(
                         "err_start_failed",
@@ -1264,8 +1478,8 @@ impl MainPage {
                 Ok(Ok(res)) => {
                     self.stopping = false;
                     self.stop_rx = None;
-                    self.stop_handle = None;
                     self.stop_deadline = None;
+                    self.stop_cancel = None;
                     if let Some(issue) = res.session_issue.as_deref() {
                         self.error = Some(i18n.tf("session_issue_warning", &[&issue]));
                     } else {
@@ -1278,16 +1492,16 @@ impl MainPage {
                 Ok(Err(e)) => {
                     self.stopping = false;
                     self.stop_rx = None;
-                    self.stop_handle = None;
                     self.stop_deadline = None;
+                    self.stop_cancel = None;
                     self.error = Some(i18n.tf("err_stop_failed", &[&e.to_string()]));
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     self.stopping = false;
                     self.stop_rx = None;
-                    self.stop_handle = None;
                     self.stop_deadline = None;
+                    self.stop_cancel = None;
                     self.error = Some(i18n.tf(
                         "err_stop_failed",
                         &[&"stop thread exited unexpectedly".to_string()],
@@ -1299,7 +1513,12 @@ impl MainPage {
             if self.starting && Instant::now() >= deadline {
                 self.starting = false;
                 self.start_rx = None;
-                self.start_handle = None; // detach：看门狗不再等卡住的线程
+                if let Some(cancel) = &self.start_cancel {
+                    cancel.store(true, Ordering::Release);
+                }
+                self.start_cancel = None;
+                // 句柄刻意保留：超时不等于线程已经退出。reap_finished_jobs()
+                // 会在它真正结束后回收，期间 start_recording 拒绝叠加新会话。
                 self.start_deadline = None;
                 self.stop_after_start = false;
                 self.watchdog_fired = true;
@@ -1314,7 +1533,11 @@ impl MainPage {
             if self.stopping && Instant::now() >= deadline {
                 self.stopping = false;
                 self.stop_rx = None;
-                self.stop_handle = None; // detach：导出线程可能仍在收尾，退出时不再 join
+                if let Some(cancel) = &self.stop_cancel {
+                    cancel.store(true, Ordering::Release);
+                }
+                self.stop_cancel = None;
+                // 同理：保留句柄直到线程真正结束；取消令牌会让 remux 在包边界退出。
                 self.stop_deadline = None;
                 self.watchdog_fired = true;
                 self.error = Some(i18n.t("err_stop_timeout").to_string());
@@ -1331,11 +1554,7 @@ impl MainPage {
         }
         // 用户已经请求退出，但当时还在“启动中”：启动完成后立刻停止，
         // 不能因为 pending_quit 就带着一个正在录制的会话退出。
-        if self.pending_quit
-            && !self.starting
-            && !self.stopping
-            && recorder.is_some()
-        {
+        if self.pending_quit && !self.starting && !self.stopping && recorder.is_some() {
             let _ = self.stop_recording(cfg, recorder, result, i18n);
         }
     }
@@ -1354,7 +1573,7 @@ impl MainPage {
         let deadline = Instant::now() + EXIT_WATCHDOG;
         loop {
             self.poll_recording_jobs(cfg, recorder, result, i18n);
-            if !self.is_busy() && recorder.is_none() {
+            if !self.is_busy() && recorder.is_none() && !self.jobs_still_running() {
                 return !self.watchdog_fired;
             }
             if Instant::now() >= deadline {
@@ -1409,11 +1628,7 @@ impl MainPage {
 
     /// 音频降级提示的文案（没有声音时）。以前它是录制页里的一行红字，
     /// 现在交给外壳的底部状态栏统一显示。
-    fn audio_warning_text(
-        &self,
-        recorder: &Option<Recorder>,
-        i18n: &I18n,
-    ) -> Option<String> {
+    fn audio_warning_text(&self, recorder: &Option<Recorder>, i18n: &I18n) -> Option<String> {
         let rec = recorder.as_ref()?;
         if rec.audio_warnings().is_empty() {
             return None;
@@ -1482,8 +1697,12 @@ impl MainPage {
                 #[cfg_attr(not(test), allow(unused_variables))]
                 let dot = theme::status_dot(ui, color);
                 #[cfg_attr(not(test), allow(unused_variables))]
-                let text_resp =
-                    ui.label(egui::RichText::new(text).size(theme::FS_STATUS).strong().color(color));
+                let text_resp = ui.label(
+                    egui::RichText::new(text)
+                        .size(theme::FS_STATUS)
+                        .strong()
+                        .color(color),
+                );
                 ui.add_space(16.0);
                 let elapsed = match (recorder, result) {
                     (Some(rec), _) => Some(rec.elapsed()),
@@ -1626,7 +1845,8 @@ impl MainPage {
         let Some(res) = result else {
             return None;
         };
-        let (_, _card) = theme::card_tight(ui, |ui| {            ui.horizontal(|ui| {
+        let (_, _card) = theme::card_tight(ui, |ui| {
+            ui.horizontal(|ui| {
                 theme::status_dot(ui, theme::ok_fg());
                 ui.label(
                     egui::RichText::new(t("result_title"))
@@ -1675,7 +1895,10 @@ impl MainPage {
                         )
                         .halign(egui::Align::LEFT),
                     );
-                    ui.label(theme::mono_muted(&elide(&res.streaming.to_string_lossy(), 72)));
+                    ui.label(theme::mono_muted(&elide(
+                        &res.streaming.to_string_lossy(),
+                        72,
+                    )));
                 });
             } else {
                 // 导出失败：只有 Cache 里的流文件（它就写在 Cache 目录里，可直接播放/剪辑）
@@ -1776,10 +1999,7 @@ impl MainPage {
 
     fn selected_geo(&self, cfg: &Config) -> Option<MonitorGeo> {
         let rank = rank_of_cfg(cfg.monitor_index);
-        self.geo
-            .get(rank)
-            .or_else(|| self.geo.first())
-            .copied()
+        self.geo.get(rank).or_else(|| self.geo.first()).copied()
     }
 
     /// 打开框选遮罩：**先抓一张桌面冻结帧**，再开一个不透明的全屏窗口把帧铺上去。
@@ -1868,10 +2088,7 @@ impl MonitorGeo {
     /// 带上虚拟桌面坐标，多屏时用户才能判断"这块屏到底是哪块"。
     fn label(&self, monitor_word: &str) -> String {
         let (l, t, r, b) = self.bounds();
-        format!(
-            "{monitor_word} ({l},{t})-({r},{b}) [{}×{}]",
-            self.w, self.h
-        )
+        format!("{monitor_word} ({l},{t})-({r},{b}) [{}×{}]", self.w, self.h)
     }
 }
 
@@ -1918,15 +2135,9 @@ enum PickDrag {
     /// 重新点选（矩形外按下，或还没有选区）
     NewSelection,
     /// 拖动某个手柄缩放（`orig` 是按下那一刻的矩形）
-    Handle {
-        h: PickHandle,
-        orig: Option<Rect>,
-    },
+    Handle { h: PickHandle, orig: Option<Rect> },
     /// 在矩形内部拖动 = 整体移动（`grab` 是按下点，`orig` 是按下那一刻的矩形）
-    Move {
-        grab: Pos2,
-        orig: Option<Rect>,
-    },
+    Move { grab: Pos2, orig: Option<Rect> },
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,7 +2499,8 @@ fn region_from_selection(map: &OverlayMapping, a: Pos2, b: Pos2) -> Option<Regio
     if w < MIN_REGION_SIDE || h < MIN_REGION_SIDE {
         return None;
     }
-    if x0 < i32::MIN as i64 || x0 > i32::MAX as i64 || y0 < i32::MIN as i64 || y0 > i32::MAX as i64 {
+    if x0 < i32::MIN as i64 || x0 > i32::MAX as i64 || y0 < i32::MIN as i64 || y0 > i32::MAX as i64
+    {
         return None;
     }
     Some(Region {
@@ -2333,8 +2545,8 @@ impl Screenshot {
 
 /// GDI 句柄的 RAII 守卫：**任何提前 return 都不会泄漏**，也不需要 `unwrap()`。
 mod gdi_guard {
-    use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, ReleaseDC, HBITMAP, HDC, HGDIOBJ};
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, ReleaseDC, HBITMAP, HDC, HGDIOBJ};
 
     /// 屏幕 DC（`GetDC(NULL)` 的产物，必须用 `ReleaseDC` 还）
     pub struct ScreenDc(pub HDC);
@@ -2379,7 +2591,11 @@ mod gdi_guard {
 /// 所以按日志惯例写 ASCII —— 这也是 `ui::i18n_guard` 要求 `main_page.rs` 零中文字面量的原因。
 fn last_error_text(what: &str) -> String {
     let e = windows::core::Error::from_thread();
-    format!("{what} failed: {} (0x{:08X})", e.message(), e.code().0 as u32)
+    format!(
+        "{what} failed: {} (0x{:08X})",
+        e.message(),
+        e.code().0 as u32
+    )
 }
 
 /// 抓取**目标显示器**的静态截图（GDI `BitBlt`，32bpp 顶朝下 BGRA → RGBA）。
@@ -2429,8 +2645,13 @@ fn capture_rect(vx: i32, vy: i32, vw: i32, vh: i32) -> Result<Screenshot, String
         let _old_guard = gdi_guard::GdiObject(old);
 
         // 屏幕 DC 的原点是虚拟桌面左上角；源坐标用显示器在桌面里的物理坐标。
-        BitBlt(mem.0, 0, 0, vw, vh, Some(screen.0), vx, vy, SRCCOPY)
-            .map_err(|e| format!("BitBlt failed: {} (0x{:08X})", e.message(), e.code().0 as u32))?;
+        BitBlt(mem.0, 0, 0, vw, vh, Some(screen.0), vx, vy, SRCCOPY).map_err(|e| {
+            format!(
+                "BitBlt failed: {} (0x{:08X})",
+                e.message(),
+                e.code().0 as u32
+            )
+        })?;
 
         // 取像素：32bpp、biHeight 为负 = 顶朝下（这样第 0 行就是屏幕最上面一行）
         let mut info = BITMAPINFO {
@@ -2538,7 +2759,8 @@ fn draw_overlay(
             });
     }
     if let (Some(tex), Some(frame)) = (pk.texture.as_ref(), pk.frame.as_ref()) {
-        ui.painter().image(tex.id(), area, map.frame_uv(frame), Color32::WHITE);
+        ui.painter()
+            .image(tex.id(), area, map.frame_uv(frame), Color32::WHITE);
     } else {
         // 没有截图（抓取失败或尺寸异常）：至少给一块中性底色，界面文字会说明原因
         ui.painter()
@@ -2566,18 +2788,9 @@ fn draw_overlay(
     if let Some(r) = sel {
         let alpha = dim_alpha_for(Some(r));
         if alpha > 0 {
-            painter.rect_filled(
-                r,
-                0.0,
-                Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
-            );
+            painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, alpha));
             // 1~2px 亮边框（浅色画面也看得清）
-            painter.rect_stroke(
-                r,
-                0.0,
-                Stroke::new(2.0, Color32::WHITE),
-                StrokeKind::Inside,
-            );
+            painter.rect_stroke(r, 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
             painter.rect_stroke(
                 r,
                 0.0,
@@ -2667,11 +2880,7 @@ fn draw_overlay(
         let pad = Vec2::new(10.0, 5.0);
         let chip = Rect::from_center_size(r.center(), galley.size() + pad * 2.0);
         painter.rect_filled(chip, 5.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
-        painter.galley(
-            chip.center() - galley.size() / 2.0,
-            galley,
-            Color32::WHITE,
-        );
+        painter.galley(chip.center() - galley.size() / 2.0, galley, Color32::WHITE);
         painter.text(
             r.center() + Vec2::new(0.0, 22.0),
             Align2::CENTER_CENTER,
@@ -2741,14 +2950,14 @@ fn draw_overlay(
         .ctx()
         .pointer_latest_pos()
         .or_else(|| resp.hover_pos())
-        .map(|p| confirm_rect.map(|b| b.expand(2.0).contains(p)).unwrap_or(false))
+        .map(|p| {
+            confirm_rect
+                .map(|b| b.expand(2.0).contains(p))
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
-    let (pressed, released) = ui.input(|i| {
-        (
-            i.pointer.primary_pressed(),
-            i.pointer.primary_released(),
-        )
-    });
+    let (pressed, released) =
+        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
     let pointer_pos = resp
         .interact_pointer_pos()
         .or_else(|| ui.ctx().pointer_latest_pos());
@@ -2767,7 +2976,10 @@ fn draw_overlay(
                     }
                     PickHit::Move => {
                         if let Some(orig) = sel {
-                            pk.drag_mode = Some(PickDrag::Move { grab: p, orig: Some(orig) });
+                            pk.drag_mode = Some(PickDrag::Move {
+                                grab: p,
+                                orig: Some(orig),
+                            });
                         }
                     }
                     PickHit::Reselect => {
@@ -2790,12 +3002,18 @@ fn draw_overlay(
             pk.cursor = Some(p);
             match pk.drag_mode {
                 Some(PickDrag::NewSelection) => {}
-                Some(PickDrag::Handle { h, orig: Some(orig) }) => {
+                Some(PickDrag::Handle {
+                    h,
+                    orig: Some(orig),
+                }) => {
                     let new = resize_by_handle(orig, h, p, area);
                     pk.anchor = Some(new.min);
                     pk.cursor = Some(new.max);
                 }
-                Some(PickDrag::Move { grab, orig: Some(orig) }) => {
+                Some(PickDrag::Move {
+                    grab,
+                    orig: Some(orig),
+                }) => {
                     let new = move_selection(orig, p - grab, area);
                     pk.anchor = Some(new.min);
                     pk.cursor = Some(new.max);
@@ -3079,11 +3297,9 @@ fn record_paths_checked(
                 .path()
                 .parent()
                 .map(|d| d.to_path_buf());
-            crate::cache::resolve_cache_dir(
-                exe_dir.as_deref(),
-                cfg_dir.as_deref(),
-                &|p: &Path| crate::config::probe_dir_writable(p).is_ok(),
-            )
+            crate::cache::resolve_cache_dir(exe_dir.as_deref(), cfg_dir.as_deref(), &|p: &Path| {
+                crate::config::probe_dir_writable_timeout(p).is_ok()
+            })
         }
     };
     Ok(record_paths(&cache_dir, &export_dir, &utc_stamp()))
@@ -3206,7 +3422,10 @@ mod tests {
         assert_eq!(clamped, area);
         // 1×1（甚至 0×0）不 panic，也不产生非法矩形
         let dot = selection_from_drag(Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0), area);
-        assert_eq!(dot, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0)));
+        assert_eq!(
+            dot,
+            Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0))
+        );
         assert_eq!(dim_alpha_for(Some(dot)), 0, "尚未拖出面积时也不压暗");
     }
 
@@ -3218,7 +3437,10 @@ mod tests {
         let sel = Rect::from_min_max(Pos2::new(300.0, 200.0), Pos2::new(700.0, 500.0));
 
         // ① 还没选区：任何按下都是"重新点选"
-        assert_eq!(picker_hit(Pos2::new(10.0, 10.0), None, area), PickHit::Reselect);
+        assert_eq!(
+            picker_hit(Pos2::new(10.0, 10.0), None, area),
+            PickHit::Reselect
+        );
 
         // ② 确定按钮优先（它就贴在右下角外侧，必须比"外部=重选"先判）
         let btn = confirm_button_rect(sel, area).expect("有效矩形应显示确定按钮");
@@ -3249,7 +3471,10 @@ mod tests {
         let edge = Rect::from_min_max(Pos2::new(600.0, 500.0), Pos2::new(1000.0, 800.0));
         let btn2 = confirm_button_rect(edge, area).expect("贴边也要有确定按钮");
         assert!(area.contains_rect(btn2), "确定按钮必须留在屏幕内");
-        assert_eq!(picker_hit(btn2.center(), Some(edge), area), PickHit::Confirm);
+        assert_eq!(
+            picker_hit(btn2.center(), Some(edge), area),
+            PickHit::Confirm
+        );
 
         // ⑦ 太小的矩形不显示确定按钮（避免误点）
         let tiny = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(13.0, 12.0));
@@ -3264,7 +3489,11 @@ mod tests {
 
         // 拖右下角到左上角另一侧 → 矩形**翻转**（拖过对角点后仍取两个角的包围盒）
         let flipped = resize_by_handle(sel, PickHandle::Se, Pos2::new(200.0, 100.0), area);
-        assert_eq!(flipped.min, Pos2::new(200.0, 100.0), "被拖到的那一点成为新的角");
+        assert_eq!(
+            flipped.min,
+            Pos2::new(200.0, 100.0),
+            "被拖到的那一点成为新的角"
+        );
         assert_eq!(flipped.max, Pos2::new(300.0, 200.0), "未动的对角点保持不变");
         assert!(flipped.width() > 0.0 && flipped.height() > 0.0);
 
@@ -3278,7 +3507,10 @@ mod tests {
         assert_eq!(moved.min, Pos2::new(350.0, 170.0));
         let pushed = move_selection(sel, Vec2::new(9999.0, 9999.0), area);
         assert_eq!(pushed.size(), sel.size());
-        assert!(area.contains_rect(pushed), "移动后必须仍在屏幕内：{pushed:?}");
+        assert!(
+            area.contains_rect(pushed),
+            "移动后必须仍在屏幕内：{pushed:?}"
+        );
     }
 
     // ---- ② 反向拖拽规范化 + ④ 夹紧 + ⑤ 1×1 不 panic ----
@@ -3296,14 +3528,19 @@ mod tests {
         assert_eq!(back, fwd, "反向拖拽必须规范化成同一个矩形");
 
         // 超出屏幕：夹紧到显示器矩形，绝不会出现"选区在屏幕之外"
-        let big = region_from_selection(&map, Pos2::new(-5000.0, -5000.0), Pos2::new(9000.0, 9000.0))
-            .expect("应夹到屏幕范围内");
+        let big =
+            region_from_selection(&map, Pos2::new(-5000.0, -5000.0), Pos2::new(9000.0, 9000.0))
+                .expect("应夹到屏幕范围内");
         assert_eq!((big.x, big.y), (0, 0));
         assert_eq!((big.width, big.height), (1920, 1080));
 
         // 1×1 这种极小选区：返回 None（界面显示"选区太小"），绝不 panic
-        assert!(region_from_selection(&map, Pos2::new(10.0, 10.0), Pos2::new(11.0, 11.0)).is_none());
-        assert!(region_from_selection(&map, Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0)).is_none());
+        assert!(
+            region_from_selection(&map, Pos2::new(10.0, 10.0), Pos2::new(11.0, 11.0)).is_none()
+        );
+        assert!(
+            region_from_selection(&map, Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0)).is_none()
+        );
         // 恰好到最小边（16）：奇数宽会被取偶到 16，仍应有效
         let min = region_from_selection(&map, Pos2::new(10.0, 10.0), Pos2::new(26.0, 26.0))
             .expect("16×16 应有效");
@@ -3460,12 +3697,28 @@ mod tests {
         };
         // ① 全屏 → 用所选显示器的实际分辨率
         assert_eq!(
-            region_info_text(CaptureMode::FullScreen, Some((1920, 1080)), cfg.region, "全屏录制", "区域录制", "未选择", "："),
+            region_info_text(
+                CaptureMode::FullScreen,
+                Some((1920, 1080)),
+                cfg.region,
+                "全屏录制",
+                "区域录制",
+                "未选择",
+                "："
+            ),
             "全屏录制：1920x1080"
         );
         // 显示器未知时的兜底（不让界面出现空洞）
         assert_eq!(
-            region_info_text(CaptureMode::FullScreen, None, cfg.region, "全屏录制", "区域录制", "未选择", ": "),
+            region_info_text(
+                CaptureMode::FullScreen,
+                None,
+                cfg.region,
+                "全屏录制",
+                "区域录制",
+                "未选择",
+                ": "
+            ),
             "全屏录制: 0x0"
         );
         // ② 区域 + 有效选区：宽高**取偶**
@@ -3476,18 +3729,52 @@ mod tests {
             height: 601,
         };
         assert_eq!(
-            region_info_text(CaptureMode::Region, Some((1920, 1080)), cfg.region, "Full Screen", "Custom Region", "not selected", ": "),
+            region_info_text(
+                CaptureMode::Region,
+                Some((1920, 1080)),
+                cfg.region,
+                "Full Screen",
+                "Custom Region",
+                "not selected",
+                ": "
+            ),
             "Custom Region: 800x600"
         );
         // ③ 区域 + 还没框选（0 尺寸 / 小于最小边）
-        cfg.region = Region { x: 0, y: 0, width: 0, height: 0 };
+        cfg.region = Region {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
         assert_eq!(
-            region_info_text(CaptureMode::Region, Some((1920, 1080)), cfg.region, "全屏录制", "区域录制", "未选择", "："),
+            region_info_text(
+                CaptureMode::Region,
+                Some((1920, 1080)),
+                cfg.region,
+                "全屏录制",
+                "区域录制",
+                "未选择",
+                "："
+            ),
             "区域录制：未选择"
         );
-        cfg.region = Region { x: 0, y: 0, width: 8, height: 8 };
+        cfg.region = Region {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
         assert_eq!(
-            region_info_text(CaptureMode::Region, Some((1920, 1080)), cfg.region, "全屏录制", "区域录制", "未选择", "："),
+            region_info_text(
+                CaptureMode::Region,
+                Some((1920, 1080)),
+                cfg.region,
+                "全屏录制",
+                "区域录制",
+                "未选择",
+                "："
+            ),
             "区域录制：未选择",
             "小于最小边（{MIN_REGION_SIDE}）也算未选择"
         );
@@ -3496,13 +3783,36 @@ mod tests {
     /// 换显示器：装得下的选区跟着搬过去并夹紧；装不下就返回 `None`（调用方清空 + 提示重选）。
     #[test]
     fn monitor_switch_moves_or_clears_the_region() {
-        let left = MonitorGeo { x: -1920, y: 0, w: 1920, h: 1080, primary: false };
-        let right = MonitorGeo { x: 0, y: 0, w: 1920, h: 1080, primary: true };
-        let small = MonitorGeo { x: 0, y: 0, w: 800, h: 600, primary: false };
+        let left = MonitorGeo {
+            x: -1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            primary: false,
+        };
+        let right = MonitorGeo {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            primary: true,
+        };
+        let small = MonitorGeo {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+            primary: false,
+        };
 
         // ① 同尺寸两屏：选区整个搬过去，坐标平移到新屏坐标系
         //    （选区是在**旧屏**上框的，所以坐标落在旧屏范围内：左屏 x ∈ [-1920, 0)）
-        let on_left = Region { x: -1820, y: 100, width: 640, height: 480 };
+        let on_left = Region {
+            x: -1820,
+            y: 100,
+            width: 640,
+            height: 480,
+        };
         let moved = region_after_monitor_switch(on_left, &left, &right).expect("同尺寸屏应能搬");
         assert_eq!(
             (moved.x, moved.y),
@@ -3512,23 +3822,44 @@ mod tests {
         assert_eq!((moved.width, moved.height), (640, 480));
 
         // ② 搬到更小的屏：装不下 → None（界面会清空选区并提示"请重新框选"）
-        let wide_on_right = Region { x: 100, y: 100, width: 1200, height: 900 };
+        let wide_on_right = Region {
+            x: 100,
+            y: 100,
+            width: 1200,
+            height: 900,
+        };
         assert_eq!(
             region_after_monitor_switch(wide_on_right, &right, &small),
             None,
             "新屏装不下时必须返回 None（宁可清空也不要留一个越界选区）"
         );
         // 小选区在小屏里装得下 → 正常保留
-        let tiny = Region { x: 10, y: 10, width: 200, height: 120 };
+        let tiny = Region {
+            x: 10,
+            y: 10,
+            width: 200,
+            height: 120,
+        };
         assert!(region_after_monitor_switch(tiny, &right, &small).is_some());
 
         // ③ 夹紧：选区部分越出显示器时被拉回来
-        let out = Region { x: 1800, y: 1000, width: 400, height: 400 };
+        let out = Region {
+            x: 1800,
+            y: 1000,
+            width: 400,
+            height: 400,
+        };
         let clamped = clamp_region_to_monitor(out, &right).expect("应能夹紧");
         assert!(clamped.x + clamped.width as i32 <= 1920);
         assert!(clamped.y + clamped.height as i32 <= 1080);
         // ④ 比最小边还小的显示器：直接返回 None（不 panic、不产生非法矩形）
-        let dot = MonitorGeo { x: 0, y: 0, w: 4, h: 4, primary: false };
+        let dot = MonitorGeo {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            primary: false,
+        };
         assert_eq!(clamp_region_to_monitor(on_left, &dot), None);
     }
 
@@ -4003,41 +4334,93 @@ mod tests {
     ///
     /// ```text
     #[test]
-fn start_watchdog_fires_and_reports_timeout() {
-    let mut page = MainPage::new();
-    let (_tx, rx) = std::sync::mpsc::channel();
-    page.start_rx = Some(rx);
-    page.starting = true;
-    page.start_deadline = Some(Instant::now() - Duration::from_secs(1));
-    let cfg = Config::default();
-    let i18n = I18n::new("en-US");
-    let mut recorder = None;
-    let mut result = None;
-    page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
-    assert!(!page.starting, "看门狗触发后不能永远 Starting");
-    assert!(page.watchdog_fired);
-    assert_eq!(page.error, Some(i18n.t("err_start_timeout").to_string()));
-}
+    fn start_watchdog_fires_and_reports_timeout() {
+        let mut page = MainPage::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        page.start_rx = Some(rx);
+        page.starting = true;
+        page.start_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let cfg = Config::default();
+        let i18n = I18n::new("en-US");
+        let mut recorder = None;
+        let mut result = None;
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(!page.starting, "看门狗触发后不能永远 Starting");
+        assert!(page.watchdog_fired);
+        assert_eq!(page.error, Some(i18n.t("err_start_timeout").to_string()));
+    }
 
-#[test]
-fn stop_watchdog_detaches_and_reports_timeout() {
-    let mut page = MainPage::new();
-    let (_tx, rx) = std::sync::mpsc::channel();
-    page.stop_rx = Some(rx);
-    page.stopping = true;
-    page.stop_deadline = Some(Instant::now() - Duration::from_secs(1));
-    let cfg = Config::default();
-    let i18n = I18n::new("en-US");
-    let mut recorder = None;
-    let mut result = None;
-    page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
-    assert!(!page.stopping, "看门狗触发后不能永远 Exporting");
-    assert!(page.watchdog_fired);
-    assert_eq!(page.error, Some(i18n.t("err_stop_timeout").to_string()));
-}
+    #[test]
+    fn stop_watchdog_detaches_and_reports_timeout() {
+        let mut page = MainPage::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        page.stop_rx = Some(rx);
+        page.stopping = true;
+        page.stop_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let cfg = Config::default();
+        let i18n = I18n::new("en-US");
+        let mut recorder = None;
+        let mut result = None;
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(!page.stopping, "看门狗触发后不能永远 Exporting");
+        assert!(page.watchdog_fired);
+        assert_eq!(page.error, Some(i18n.t("err_stop_timeout").to_string()));
+    }
 
-/// cargo test --lib async_start_stop_probe -- --ignored --nocapture
+    /// cargo test --lib async_start_stop_probe -- --ignored --nocapture
     /// ```
+    #[test]
+    fn watchdog_signals_and_reaps_a_stuck_start_job() {
+        let mut page = MainPage::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        page.start_rx = Some(rx);
+        page.starting = true;
+        page.start_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let cancel = Arc::new(AtomicBool::new(false));
+        page.start_cancel = Some(Arc::clone(&cancel));
+        page.start_handle = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(80));
+        }));
+        let cfg = Config::default();
+        let i18n = I18n::new("en-US");
+        let mut recorder = None;
+        let mut result = None;
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(cancel.load(Ordering::Acquire), "看门狗必须发取消信号");
+        assert!(page.start_handle.is_some(), "线程未退出前必须保留句柄");
+        assert!(
+            page.jobs_still_running(),
+            "旧任务未退出时不能允许叠加新会话"
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(page.start_handle.is_none(), "线程退出后应回收句柄");
+        assert!(!page.jobs_still_running());
+    }
+
+    #[test]
+    fn watchdog_signals_and_reaps_a_stuck_stop_job() {
+        let mut page = MainPage::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        page.stop_rx = Some(rx);
+        page.stopping = true;
+        page.stop_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let cancel = Arc::new(AtomicBool::new(false));
+        page.stop_cancel = Some(Arc::clone(&cancel));
+        page.stop_handle = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(80));
+        }));
+        let cfg = Config::default();
+        let i18n = I18n::new("en-US");
+        let mut recorder = None;
+        let mut result = None;
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(cancel.load(Ordering::Acquire), "停止超时后必须请求取消导出");
+        assert!(page.stop_handle.is_some(), "收尾线程未退出前必须保留句柄");
+        std::thread::sleep(Duration::from_millis(120));
+        page.poll_recording_jobs(&cfg, &mut recorder, &mut result, &i18n);
+        assert!(page.stop_handle.is_none(), "收尾线程退出后应回收句柄");
+    }
     #[test]
     #[ignore = "真机异步起停探针（需要显示器/OpenH264），用 --ignored 手动运行"]
     fn async_start_stop_probe() {
@@ -4057,7 +4440,10 @@ fn stop_watchdog_detaches_and_reports_timeout() {
 
         let t = Instant::now();
         let _ = page.start_recording(&cfg, &mut recorder, &mut result, &i18n);
-        assert!(t.elapsed() < Duration::from_millis(500), "start 不能阻塞 UI");
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "start 不能阻塞 UI"
+        );
         assert!(page.is_busy());
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline && recorder.is_none() && page.is_busy() {
@@ -4184,7 +4570,10 @@ fn stop_watchdog_detaches_and_reports_timeout() {
             println!("     状态点            {:.1}", p.status_dot_h);
             println!("     状态文字          {:.1}", p.status_text_h);
             println!("     时间码文本自身    {:.1}", p.timer_text_h);
-            println!("     右侧「开始录制」  {:.1} 高 × {:.1} 宽", p.start_btn_h, p.start_btn_w);
+            println!(
+                "     右侧「开始录制」  {:.1} 高 × {:.1} 宽",
+                p.start_btn_h, p.start_btn_w
+            );
             println!(
                 "     行内撑高余量      {:.1}（行高 − 最高部件）",
                 p.status_row_stack_h
