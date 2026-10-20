@@ -121,7 +121,7 @@ struct App {
     /// 启动时若"输出目录"被回退改写过：等首帧给用户提示之后，再把新目录落盘一次
     output_dir_dirty: bool,
 
-    /// 流文件所在的 Cache 目录（程序所在目录优先，不可写时退到配置目录）
+    /// 流文件所在的 Cache 目录（LocalAppData 优先，不可用时退到程序目录 → 配置目录 → %TEMP%）
     cache_dir: std::path::PathBuf,
     /// **本次运行**是否已经弹过"请清理 Cache"的关闭提醒（内存标志，不写配置）
     cache_warned: bool,
@@ -712,12 +712,6 @@ impl App {
             .as_mut()
             .map(|saver| saver.drain())
             .unwrap_or_default();
-        if dead {
-            // worker 已经 panic：不能让 in-flight 永远悬着；下一帧 fallback 到同步保存。
-            self.cfg_saver = None;
-            self.cfg_save_inflight = None;
-            self.push_cfg_save_error("后台配置保存线程异常退出");
-        }
         if results.is_empty() && !dead {
             return;
         }
@@ -733,6 +727,13 @@ impl App {
                 }
                 Err(e) => self.push_cfg_save_error(&e),
             }
+        }
+        if dead {
+            // 结果先处理完，再追加 worker 死亡提示；否则同一批里的 Ok 结果
+            // 会把它当成可自愈错误清掉。
+            self.cfg_saver = None;
+            self.cfg_save_inflight = None;
+            self.push_cfg_save_error("后台配置保存线程异常退出");
         }
     }
 
@@ -796,7 +797,7 @@ impl App {
                 caplite::tray::TrayCommand::ToggleRecording => self.recording_from_tray(),
                 // 托盘菜单「停止录制」：窗口藏起来之后这是唯一够得着的停止入口之一
                 caplite::tray::TrayCommand::StopRecording => {
-                    if self.recorder.is_some() || self.main.is_busy() {
+                    if self.main.has_active_recording_path(self.recorder.is_some()) {
                         self.recording_from_tray();
                     }
                 }
@@ -833,9 +834,9 @@ impl App {
 
         // 录制中、或者窗口是我们藏起来的 → 持续要帧（时长/统计要刷新；
         // 也让"万一还有没落地的 viewport 命令"有机会在下一帧被处理）。
-        if self.recorder.is_some() || self.main.is_busy() || self.hide.hidden_by_us() {
-            // `main.is_busy()` 包括后台 start/stop：这段时间没有 recorder 可读，
-            // 必须自己排帧去 `poll_recording_jobs`，否则结果到了界面也不会更新。
+        if self.main.has_active_recording_path(self.recorder.is_some()) || self.hide.hidden_by_us() {
+            // 后台 start/stop 期间没有 recorder 可读，必须自己排帧去
+            // `poll_recording_jobs`，否则结果到了界面也不会更新。
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1141,7 +1142,7 @@ impl App {
         self.pump_cfg_saves();
 
         // 录制中要持续刷新（时长、统计、状态）；后台 start/stop 期间也要排帧收结果。
-        if self.recorder.is_some() || self.main.is_busy() {
+        if self.main.has_active_recording_path(self.recorder.is_some()) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1156,9 +1157,9 @@ impl App {
         // 空目录 / 已提醒过 → 直接放行关闭（`should_warn_cache` 是纯函数，有单测）。
         let close_requested = ui.ctx().input(|i| i.viewport().close_requested());
         if close_requested && !self.close_confirmed {
-            // 正在开始/停止/录制：先取消这次关闭，等在途工作完成后再自动关闭。
-            // 不能在这里直接放行：`Recorder` 可能已经被移到后台线程，进程退出会丢掉导出。
-            if self.main.is_busy() || self.recorder.is_some() {
+            // 正在 start/stop/录制/后台 job 未结束：先取消关闭，等在途工作完成后再自动关。
+            // 不能直接放行：Recorder 可能已经被移到后台线程，进程退出会丢导出。
+            if self.main.has_active_recording_path(self.recorder.is_some()) {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.main.request_quit_after_finish();

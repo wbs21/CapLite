@@ -1,6 +1,6 @@
 [package]
 name = "caplite"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Windows 屏幕录制：全屏/区域 + OpenH264 视频 + AAC-LC 音频 + 流模式 MP4 + 关键帧剪辑"
 build = "build.rs"

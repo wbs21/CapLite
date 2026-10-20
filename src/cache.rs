@@ -155,33 +155,44 @@ pub fn prune_derived(dir: &Path, max_files: usize, max_age: std::time::Duration)
     removed
 }
 
-/// 选 Cache 目录：**优先程序所在目录**（`<exe>\Cache`），不可写时退到
-/// `<配置目录>\Cache`，再不行就临时目录 —— 全部走"真写一个探测文件"的可写探测。
+/// 选 Cache 目录：**优先每用户 LocalAppData**（`<LocalAppData>\CapLite\Cache`），
+/// 不可用时退到程序所在目录（便携版），再不行就临时目录 ——
+/// 全部走"真写一个探测文件"的可写探测 + junction 检查。
+///
+/// 为什么 LocalAppData 优先：
+/// * 每用户 ACL 隔离，其他用户/非管理员进程无法读写我们的分片 MP4；
+/// * 不存在"用户以管理员身份运行 → exe 目录可被重定向删除"的风险（审计 P0-3）；
+/// * 便携版把 exe 放在下载目录/桌面时，LocalAppData 仍有独立的、稳定的缓存位置。
+///
+/// 为什么不彻底去掉 exe 目录：极少数"绿色安装"用户可能真的希望一键删除 exe 就
+/// 带走全部数据，所以 exe 目录作为第二选择保留。
 pub fn resolve_cache_dir(
     exe_dir: Option<&Path>,
     config_dir: Option<&Path>,
     probe: &dyn Fn(&Path) -> bool,
 ) -> PathBuf {
-    if let Some(d) = exe_dir {
-        let c = d.join(CACHE_DIR_NAME);
-        if is_plain_dir(&c) && probe(&c) && is_plain_dir(&c) {
-            return c;
-        }
-    }
-    if let Some(d) = config_dir {
-        let c = d.join(CACHE_DIR_NAME);
-        if is_plain_dir(&c) && probe(&c) && is_plain_dir(&c) {
-            return c;
-        }
-    }
-    // 程序目录/配置目录都不可写（或被 junction 污染）时，优先每用户 LocalAppData；
-    // 它比 %TEMP% 更稳定，也不会被其他会话共享。
+    // 第一选择：每用户 LocalAppData —— ACL 隔离最干净，也是所有现代 Windows 应用的惯例。
     if let Some(base) = directories::BaseDirs::new() {
         let c = base.data_local_dir().join("CapLite").join(CACHE_DIR_NAME);
         if is_plain_dir(&c) && probe(&c) && is_plain_dir(&c) {
             return c;
         }
     }
+    // 第二选择：程序所在目录（便携版 fallback）。
+    if let Some(d) = exe_dir {
+        let c = d.join(CACHE_DIR_NAME);
+        if is_plain_dir(&c) && probe(&c) && is_plain_dir(&c) {
+            return c;
+        }
+    }
+    // 第三选择：配置目录（有些安装器会把 exe 放在只读位置但配置目录可写）。
+    if let Some(d) = config_dir {
+        let c = d.join(CACHE_DIR_NAME);
+        if is_plain_dir(&c) && probe(&c) && is_plain_dir(&c) {
+            return c;
+        }
+    }
+    // 最后兜底：%TEMP%。几乎永远不会走到，前三个正常有一个能用。
     std::env::temp_dir().join("CapLite").join(CACHE_DIR_NAME)
 }
 
@@ -301,20 +312,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Cache 目录选择：exe 目录优先 → 配置目录 → 临时目录；探测失败就往下退。
+    /// Cache 目录选择：LocalAppData 优先 → exe 目录 → 配置目录 → 临时目录；
+    /// 探测失败就往下退。
     #[test]
-    fn cache_dir_prefers_exe_dir_then_config_dir() {
+    fn cache_dir_prefers_local_appdata_then_exe_dir() {
         let exe = Path::new(r"C:\app");
         let cfg = Path::new(r"C:\cfg");
-        assert_eq!(
-            resolve_cache_dir(Some(exe), Some(cfg), &|_| true),
-            exe.join(CACHE_DIR_NAME)
+        // 测试环境里 LocalAppData 必然存在且可写（跑测试的就是一个真实用户），
+        // probe 全 true 时应该先命中它。LocalAppData 在 Windows 上形如
+        // C:\Users\<User>\AppData\Local\CapLite\Cache。
+        let d = resolve_cache_dir(Some(exe), Some(cfg), &|_| true);
+        // 受限测试进程可能拿不到 BaseDirs（例如没有 LOCALAPPDATA/USERPROFILE），
+        // 这时公开 API 会正确回退到 exe 目录；只有能解析用户目录时才断言首选项。
+        if directories::BaseDirs::new().is_some() {
+            assert!(
+                d.components().any(|c| c.as_os_str() == "CapLite"),
+                "LocalAppData 路径应包含 CapLite 段，实际: {}",
+                d.display()
+            );
+        }
+        assert!(
+            d.ends_with(CACHE_DIR_NAME),
+            "{}",
+            d.display()
         );
-        assert_eq!(
-            resolve_cache_dir(Some(exe), Some(cfg), &|p| p.starts_with(cfg)),
-            cfg.join(CACHE_DIR_NAME)
-        );
+
+        // probe 对所有路径都 false → 落到 %TEMP%。
         let d = resolve_cache_dir(Some(exe), Some(cfg), &|_| false);
         assert!(d.ends_with(CACHE_DIR_NAME), "{}", d.display());
+    }
+
+    /// 当 LocalAppData 不可写（probe 返回 false）时，应该回退到 exe 目录。
+    #[test]
+    fn cache_dir_falls_back_to_exe_when_local_appdata_unwritable() {
+        let exe = Path::new(r"C:\app");
+        let cfg = Path::new(r"C:\cfg");
+        // LocalAppData 不可写 → probe 对非 exe 路径返回 false
+        let d = resolve_cache_dir(Some(exe), Some(cfg), &|p| {
+            p.starts_with(exe)
+        });
+        assert_eq!(d, exe.join(CACHE_DIR_NAME));
     }
 }

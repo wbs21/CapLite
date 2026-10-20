@@ -274,6 +274,12 @@ impl AtomicExport {
     }
 
     fn commit_with(mut self, replace: bool) -> Result<u64, AppError> {
+        if crate::sys::has_reparse_ancestor(&self.dst) {
+            return Err(AppError::Mp4(format!(
+                "导出目标父目录包含符号链接/junction，拒绝提交：{}",
+                self.dst.display()
+            )));
+        }
         drop(self.placeholder.take());
         let size = std::fs::metadata(&self.temp).map(|m| m.len()).unwrap_or(0);
         replace_file(&self.temp, &self.dst, replace)
@@ -348,6 +354,17 @@ fn open_exclusive_placeholder(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+fn open_existing_placeholder(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    opts.open(path)
+}
+
 /// 视频流参数
 #[derive(Debug, Clone)]
 pub struct VideoParams {
@@ -378,6 +395,8 @@ pub struct FragmentedMp4Writer {
     path: PathBuf,
     finished: bool,
     bytes_hint: u64,
+    /// 预占输出文件的句柄，防止写入期间路径被替换。
+    placeholder: Option<std::fs::File>,
 }
 
 // SAFETY: AVFormatContext 只在写入线程内使用；这里不做跨线程共享，仅让类型能放进结构体
@@ -399,7 +418,19 @@ impl FragmentedMp4Writer {
                 path.display()
             )));
         }
-        Self::create_unchecked(path, video, audio)
+        let placeholder = open_exclusive_placeholder(path).map_err(|e| {
+            AppError::Mp4(format!("创建录制文件 {} 失败：{e}", path.display()))
+        })?;
+        let mut writer = match Self::create_unchecked(path, video, audio) {
+            Ok(w) => w,
+            Err(e) => {
+                drop(placeholder);
+                let _ = std::fs::remove_file(path);
+                return Err(e);
+            }
+        };
+        writer.placeholder = Some(placeholder);
+        Ok(writer)
     }
 
     /// 录制器已经用 `StartGuard` 预占了路径；允许打开这个空占位。
@@ -408,7 +439,12 @@ impl FragmentedMp4Writer {
         video: Option<&VideoParams>,
         audio: Option<&AudioParams>,
     ) -> Result<Self, AppError> {
-        Self::create_unchecked(path, video, audio)
+        let placeholder = open_existing_placeholder(path).map_err(|e| {
+            AppError::Mp4(format!("打开录制占位文件 {} 失败：{e}", path.display()))
+        })?;
+        let mut writer = Self::create_unchecked(path, video, audio)?;
+        writer.placeholder = Some(placeholder);
+        Ok(writer)
     }
 
     fn create_unchecked(
@@ -416,6 +452,12 @@ impl FragmentedMp4Writer {
         video: Option<&VideoParams>,
         audio: Option<&AudioParams>,
     ) -> Result<Self, AppError> {
+        if crate::sys::has_reparse_ancestor(path) {
+            return Err(AppError::Mp4(format!(
+                "录制输出父目录包含符号链接/junction：{}",
+                path.display()
+            )));
+        }
         if video.is_none() && audio.is_none() {
             return Err(AppError::Mp4("至少要有一个视频或音频流".into()));
         }
@@ -517,6 +559,7 @@ impl FragmentedMp4Writer {
                 path: path.to_path_buf(),
                 finished: false,
                 bytes_hint: 0,
+                placeholder: None,
             })
         }
     }

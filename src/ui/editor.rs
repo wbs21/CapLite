@@ -2812,9 +2812,10 @@ impl EditorPage {
 
     /// 注入**波形 L0 的落盘缓存目录**（外壳按既有回退链解析好的 `Cache\`）。
     ///
-    /// 为什么由外壳注入而不是剪辑页自己算：缓存目录的回退链（程序目录 → 配置目录 →
-    /// 临时目录）已经在外壳启动时算过一次（`cache::resolve_cache_dir`），
-    /// 这里再算一遍就会有两份"同一个目录"的推导，早晚会不一致。
+    /// 为什么由外壳注入而不是剪辑页自己算：缓存目录的回退链（LocalAppData →
+    /// 程序目录 → 配置目录 → 临时目录）已经在外壳启动时算过一次
+    /// （`cache::resolve_cache_dir`），这里再算一遍就会有两份"同一个目录"的推导，
+    /// 早晚会不一致。
     /// `None` = 不落盘（功能照常，只是每次都重算）。
     pub fn set_wave_cache_dir(&mut self, dir: Option<PathBuf>) {
         self.wave.set_disk_dir(dir);

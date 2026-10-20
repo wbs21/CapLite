@@ -917,18 +917,56 @@ impl Recorder {
             let gateways: Vec<Arc<AudioGateway>> = (0..n_sources)
                 .map(|_| Arc::new(AudioGateway::new()))
                 .collect();
-            for g in &gateways {
-                // P52：搬运线程起不来就报出来，别 panic（与上面"创建音频读取线程失败"同口径）。
-                g.start_transport()
-                    .map_err(|e| AppError::Audio(format!("创建音频搬运线程失败: {e}")))?;
+            // 搬运线程启动失败 = 该路音源降级（跳过，录制继续，只是没这一路声音）。
+            // 不硬失败：极端资源压力下放活"至少能录到画面"的兜底，而不是一挂全挂。
+            // 失败的 gateway 不会被读取线程推、不会被消费线程取、停止时也不会 stop。
+            let mut active_gateways: Vec<Arc<AudioGateway>> = Vec::with_capacity(n_sources);
+            let mut skipped_gateway_indices: Vec<usize> = Vec::new();
+            for (i, g) in gateways.iter().enumerate() {
+                match g.start_transport() {
+                    Ok(()) => active_gateways.push(Arc::clone(g)),
+                    Err(e) => {
+                        skipped_gateway_indices.push(i);
+                        tracing::warn!(
+                            i,
+                            error = %e,
+                            "音频搬运线程启动失败，该路音源将被跳过（降级录制）"
+                        );
+                        note_issue(
+                            &issue,
+                            format!("音频搬运线程启动失败，第 {i} 路音源被跳过：{e}"),
+                        );
+                    }
+                }
+            }
+            let n_active_sources = active_gateways.len();
+            // 全部搬运线程都起不来 → 整路音频降级（纯视频录制继续）。
+            // 这里不手动 drop gateways/aac —— 让 Rust 自动 drop；
+            // 消费线程闭包只在 n_active_sources > 0 时才会 spawn（不会触发 move-after-drop）。
+            if n_active_sources == 0 {
+                tracing::error!(
+                    "所有音频搬运线程启动失败，本次录制无音轨（{n_sources} 路音源全降级）"
+                );
+                note_issue(
+                    &issue,
+                    format!("所有音频搬运线程启动失败，本次录制无音轨（用户申请 {n_sources} 路）"),
+                );
             }
             // 读取线程退出计数：消费线程据此在停止时"先等读齐、再停搬运、后抽干大环"，
             // 保证收尾不吞掉尾部音频。
             let reads_done = Arc::new(AtomicUsize::new(0));
             // 重建麦克风采集时要用：按用户指定的设备 ID 重解（设备没了会回落到默认）
             let mic_device_id = cfg.mic_device_id.clone();
+            // 跳过搬运线程启动失败的那些音源 —— 不 spawn 读取线程、不 spawn 消费线程。
+            // 读取线程数量 = 消费线程等待的数量，两者必须对齐才能正确收尾。
+            let audio_sources: Vec<_> = audio_sources.into_iter().enumerate()
+                .filter(|(i, _)| !skipped_gateway_indices.contains(i))
+                .map(|(_, cap)| cap)
+                .collect();
             for (i, cap) in audio_sources.into_iter().enumerate() {
-                let gw = Arc::clone(&gateways[i]);
+                // 注意：现在 gateways 的索引对应"过滤后"的顺序，
+                // active_gateways[i] 就是这个读取线程该 push 的那个网关
+                let gw = Arc::clone(&active_gateways[i]);
                 let stop = Arc::clone(&stop);
                 let state = Arc::clone(&state);
                 let stats = Arc::clone(&stats);
@@ -1063,156 +1101,161 @@ impl Recorder {
             // 消费线程：补静音 → 混音 → AAC → 送封装队列
             // 与视频线程同一个"录制开始"原点：补静音按这个原点算，音视频时长才对得上
             let session_start = started;
-            let issue_thread = Arc::clone(&issue);
-            start_guard.push(
-                spawn_guarded(
-                    "cap-audio",
-                    Arc::clone(&issue),
-                    Arc::clone(&stop_flag),
-                    Arc::clone(&state),
-                    move || {
-                        set_current_thread_priority(ThreadPriority::AboveNormal);
-                        let start = session_start;
-                        let mut scratch: Vec<Vec<f32>> =
-                            (0..n_sources).map(|_| Vec::new()).collect();
-                        let mut got_frames: Vec<usize> = vec![0; n_sources];
-                        let mut consumed: Vec<usize> = vec![0; n_sources];
-                        let mut mixed: Vec<f32> = Vec::new();
-                        let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
-                        let mut aac_index: u64 = 0;
-
-                        loop {
-                            let stopping = stop.load(Ordering::Relaxed);
-                            // 停止收尾顺序：等读取线程全部退出 → 停搬运（小环残留进大环）
-                            // → 抽干大环。反过来会丢掉尾部音频。
-                            if stopping && reads_done.load(Ordering::SeqCst) >= n_sources {
-                                for g in &gateways {
-                                    g.stop();
-                                }
-                                if gateways.iter().all(|g| g.big().is_empty()) {
-                                    break;
-                                }
-                            }
-                            // 非阻塞取走各路大环当前全部样本
-                            let mut got_any = false;
-                            for (i, g) in gateways.iter().enumerate() {
-                                let got = g.pop_available(&mut scratch[i]);
-                                got_frames[i] = got;
-                                if got > 0 {
-                                    got_any = true;
-                                }
-                            }
-                            if !got_any {
-                                if stopping {
-                                    // 等读取线程退出 / 搬运收尾
-                                    if let Some(first) = gateways.first() {
-                                        first.wait_data(Duration::from_millis(20));
+            // 搬运线程全部起不来 = 跳过消费线程，录制走纯视频路径
+            if n_active_sources > 0 {
+                let gateways = active_gateways.clone();
+                let n_sources = n_active_sources;
+                let issue_thread = Arc::clone(&issue);
+                start_guard.push(
+                    spawn_guarded(
+                        "cap-audio",
+                        Arc::clone(&issue),
+                        Arc::clone(&stop_flag),
+                        Arc::clone(&state),
+                        move || {
+                            set_current_thread_priority(ThreadPriority::AboveNormal);
+                            let start = session_start;
+                            let mut scratch: Vec<Vec<f32>> =
+                                (0..n_sources).map(|_| Vec::new()).collect();
+                            let mut got_frames: Vec<usize> = vec![0; n_sources];
+                            let mut consumed: Vec<usize> = vec![0; n_sources];
+                            let mut mixed: Vec<f32> = Vec::new();
+                            let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
+                            let mut aac_index: u64 = 0;
+    
+                            loop {
+                                let stopping = stop.load(Ordering::Relaxed);
+                                // 停止收尾顺序：等读取线程全部退出 → 停搬运（小环残留进大环）
+                                // → 抽干大环。反过来会丢掉尾部音频。
+                                if stopping && reads_done.load(Ordering::SeqCst) >= n_sources {
+                                    for g in &gateways {
+                                        g.stop();
                                     }
+                                    if gateways.iter().all(|g| g.big().is_empty()) {
+                                        break;
+                                    }
+                                }
+                                // 非阻塞取走各路大环当前全部样本
+                                let mut got_any = false;
+                                for (i, g) in gateways.iter().enumerate() {
+                                    let got = g.pop_available(&mut scratch[i]);
+                                    got_frames[i] = got;
+                                    if got > 0 {
+                                        got_any = true;
+                                    }
+                                }
+                                if !got_any {
+                                    if stopping {
+                                        // 等读取线程退出 / 搬运收尾
+                                        if let Some(first) = gateways.first() {
+                                            first.wait_data(Duration::from_millis(20));
+                                        }
+                                        continue;
+                                    }
+                                    // 运行中没数据：等 10 ms 或被新数据唤醒。
+                                    // 注意：**不跳过下面的补静音** —— 静默期环回不产包，
+                                    // 墙钟补齐是音轨不短于视频的唯一保障（docs/DESIGN.md §11.6.1）。
+                                    if let Some(first) = gateways.first() {
+                                        first.wait_data(Duration::from_millis(10));
+                                    }
+                                }
+                                if !stopping {
+                                    let target =
+                                        (start.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
+                                    let mut fatal_gap = None;
+                                    for (i, buf) in scratch.iter_mut().enumerate() {
+                                        let have = consumed[i] + got_frames[i];
+                                        if target > have {
+                                            let gap = target - have;
+                                            if gap > MAX_SILENCE_PAD_FRAMES {
+                                                // 不“跳过”：跳过等于音轨永久少一段，后面所有
+                                                // 音频都会比视频早。超过上限就把它当会话失败，
+                                                // 正常停止并让用户看到 session_issue。
+                                                fatal_gap = Some(gap);
+                                                break;
+                                            }
+                                            // 静音期环回不产数据 → 按墙上时钟补静音
+                                            mixer::push_silence(buf, gap);
+                                            lock_or_recover(&stats).silence_padded_frames +=
+                                                gap as u64;
+                                        }
+                                        consumed[i] = target.max(have);
+                                    }
+                                    if let Some(gap) = fatal_gap {
+                                        lock_or_recover(&stats).audio_timeline_jumps += 1;
+                                        let msg = format!(
+                                            "音频消费线程停顿过久（{} ms），为避免音画漂移停止录制",
+                                            gap as u64 * 1000 / SAMPLE_RATE as u64
+                                        );
+                                        tracing::error!(
+                                            gap_frames = gap,
+                                            gap_ms = gap as u64 * 1000 / SAMPLE_RATE as u64,
+                                            "音频时间轴跳变超出上限：停止录制，不再跳过静音"
+                                        );
+                                        note_issue(&issue_thread, msg.clone());
+                                        *lock_or_recover(&state) = RecorderState::Failed(msg);
+                                        stop.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                let refs: Vec<&[f32]> = scratch.iter().map(|v| v.as_slice()).collect();
+                                mixer::mix_into(&refs, &mut mixed);
+                                for v in scratch.iter_mut() {
+                                    v.clear();
+                                }
+                                if mixed.is_empty() {
                                     continue;
                                 }
-                                // 运行中没数据：等 10 ms 或被新数据唤醒。
-                                // 注意：**不跳过下面的补静音** —— 静默期环回不产包，
-                                // 墙钟补齐是音轨不短于视频的唯一保障（docs/DESIGN.md §11.6.1）。
-                                if let Some(first) = gateways.first() {
-                                    first.wait_data(Duration::from_millis(10));
-                                }
-                            }
-                            if !stopping {
-                                let target =
-                                    (start.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as usize;
-                                let mut fatal_gap = None;
-                                for (i, buf) in scratch.iter_mut().enumerate() {
-                                    let have = consumed[i] + got_frames[i];
-                                    if target > have {
-                                        let gap = target - have;
-                                        if gap > MAX_SILENCE_PAD_FRAMES {
-                                            // 不“跳过”：跳过等于音轨永久少一段，后面所有
-                                            // 音频都会比视频早。超过上限就把它当会话失败，
-                                            // 正常停止并让用户看到 session_issue。
-                                            fatal_gap = Some(gap);
-                                            break;
-                                        }
-                                        // 静音期环回不产数据 → 按墙上时钟补静音
-                                        mixer::push_silence(buf, gap);
-                                        lock_or_recover(&stats).silence_padded_frames +=
-                                            gap as u64;
-                                    }
-                                    consumed[i] = target.max(have);
-                                }
-                                if let Some(gap) = fatal_gap {
-                                    lock_or_recover(&stats).audio_timeline_jumps += 1;
-                                    let msg = format!(
-                                        "音频消费线程停顿过久（{} ms），为避免音画漂移停止录制",
-                                        gap as u64 * 1000 / SAMPLE_RATE as u64
-                                    );
-                                    tracing::error!(
-                                        gap_frames = gap,
-                                        gap_ms = gap as u64 * 1000 / SAMPLE_RATE as u64,
-                                        "音频时间轴跳变超出上限：停止录制，不再跳过静音"
-                                    );
-                                    note_issue(&issue_thread, msg.clone());
-                                    *lock_or_recover(&state) = RecorderState::Failed(msg);
+                                out.clear();
+                                if let Err(e) = aac.encode(&mixed, &mut out) {
+                                    tracing::error!("AAC 编码失败: {e}");
+                                    note_issue(&issue_thread, format!("AAC 编码失败: {e}"));
+                                    *lock_or_recover(&state) =
+                                        RecorderState::Failed(format!("AAC 编码失败: {e}"));
                                     stop.store(true, Ordering::Relaxed);
                                     break;
                                 }
-                            }
-                            let refs: Vec<&[f32]> = scratch.iter().map(|v| v.as_slice()).collect();
-                            mixer::mix_into(&refs, &mut mixed);
-                            for v in scratch.iter_mut() {
-                                v.clear();
-                            }
-                            if mixed.is_empty() {
-                                continue;
-                            }
-                            out.clear();
-                            if let Err(e) = aac.encode(&mixed, &mut out) {
-                                tracing::error!("AAC 编码失败: {e}");
-                                note_issue(&issue_thread, format!("AAC 编码失败: {e}"));
-                                *lock_or_recover(&state) =
-                                    RecorderState::Failed(format!("AAC 编码失败: {e}"));
-                                stop.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            for (data, _pts) in out.drain(..) {
-                                let pts_ms = aac_index as i64 * FRAME_SAMPLES as i64 * 1000
-                                    / SAMPLE_RATE as i64;
-                                // 音频包很小且不允许丢，队列满就等一会儿
-                                if tx
-                                    .send_timeout(
-                                        MuxMsg::Audio { data, pts_ms },
-                                        Duration::from_millis(200),
-                                    )
-                                    .is_err()
-                                {
-                                    break;
+                                for (data, _pts) in out.drain(..) {
+                                    let pts_ms = aac_index as i64 * FRAME_SAMPLES as i64 * 1000
+                                        / SAMPLE_RATE as i64;
+                                    // 音频包很小且不允许丢，队列满就等一会儿
+                                    if tx
+                                        .send_timeout(
+                                            MuxMsg::Audio { data, pts_ms },
+                                            Duration::from_millis(200),
+                                        )
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    lock_or_recover(&stats).audio_frames += 1;
+                                    aac_index += 1;
                                 }
-                                lock_or_recover(&stats).audio_frames += 1;
-                                aac_index += 1;
                             }
-                        }
-                        // 冲刷编码器残留
-                        out.clear();
-                        if aac.finish(&mut out).is_ok() {
-                            for (data, _pts) in out.drain(..) {
-                                let pts_ms = aac_index as i64 * FRAME_SAMPLES as i64 * 1000
-                                    / SAMPLE_RATE as i64;
-                                let _ = tx.send(MuxMsg::Audio { data, pts_ms });
-                                aac_index += 1;
+                            // 冲刷编码器残留
+                            out.clear();
+                            if aac.finish(&mut out).is_ok() {
+                                for (data, _pts) in out.drain(..) {
+                                    let pts_ms = aac_index as i64 * FRAME_SAMPLES as i64 * 1000
+                                        / SAMPLE_RATE as i64;
+                                    let _ = tx.send(MuxMsg::Audio { data, pts_ms });
+                                    aac_index += 1;
+                                }
                             }
-                        }
-                        let _ = tx.send(MuxMsg::AudioEnd);
-                        // 环形缓冲丢弃样本入账（0 = 全程没有溢出；非 0 = 机器被拖到极限过）
-                        let dropped: u64 = gateways.iter().map(|g| g.dropped_samples()).sum();
-                        lock_or_recover(&stats).audio_ring_dropped = dropped;
-                        if dropped > 0 {
-                            tracing::warn!(
-                                dropped,
-                                "音频环形缓冲出现过溢出（丢最旧保最新）：消费侧停顿超过了大环兜底能力"
-                            );
-                        }
-                    })
-                    .map_err(|e| AppError::Audio(format!("创建音频线程失败: {e}")))?,
-            );
+                            let _ = tx.send(MuxMsg::AudioEnd);
+                            // 环形缓冲丢弃样本入账（0 = 全程没有溢出；非 0 = 机器被拖到极限过）
+                            let dropped: u64 = gateways.iter().map(|g| g.dropped_samples()).sum();
+                            lock_or_recover(&stats).audio_ring_dropped = dropped;
+                            if dropped > 0 {
+                                tracing::warn!(
+                                    dropped,
+                                    "音频环形缓冲出现过溢出（丢最旧保最新）：消费侧停顿超过了大环兜底能力"
+                                );
+                            }
+                        })
+                        .map_err(|e| AppError::Audio(format!("创建音频线程失败: {e}")))?,
+                );
+            }
         }
         drop(audio_tx);
 

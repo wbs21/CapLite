@@ -93,6 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // 连续手动跑 smoke 时允许覆盖上一次的测试产物；产品录制路径仍由
+    // StartGuard/create_new 保证不覆盖用户文件。
+    let _ = std::fs::remove_file(&out);
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)

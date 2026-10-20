@@ -13,6 +13,7 @@
 //! * 所有相对路径都以 **exe 目录**为基准解析，不依赖 CWD。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// 回退到 exe 同级时使用的子目录名（`<exe 目录>\cap-recordings`）。
@@ -21,6 +22,10 @@ pub(crate) const EXE_SUBDIR: &str = "cap-recordings";
 pub(crate) const USER_CONFIG_SUBDIR: &str = "cap";
 /// 配置文件名（与 [`super::CONFIG_FILE`] 保持一致，这里给纯逻辑用）。
 pub const CONFIG_FILE: &str = "config.json";
+
+/// 配置/输出目录探测最多允许一个超时后仍未结束的后台线程。
+/// 单个系统调用无法强行中断，但至少不能让快速改目录无限叠加探针线程。
+static PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// 一次"探测过的目录"记录：无论成败都留下来，用于拼出可操作的错误信息。
 #[derive(Debug, Clone)]
@@ -120,17 +125,40 @@ pub fn probe_dir_writable_timeout_with_budget(
     if budget.is_zero() {
         return Err(format!("目录探测预算已耗尽：{}", dir.display()));
     }
+    let started = std::time::Instant::now();
+    loop {
+        if PROBE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+        if started.elapsed() >= budget {
+            return Err(format!(
+                "已有目录探测线程未在预算内结束：{}",
+                dir.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let p = dir.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("cfg-probe".into())
         .spawn(move || {
-            let _ = tx.send(probe_dir_writable(&p));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                probe_dir_writable(&p)
+            }));
+            PROBE_IN_FLIGHT.store(false, Ordering::Release);
+            let result = result.unwrap_or_else(|_| Err("目录探测线程 panic".into()));
+            let _ = tx.send(result);
         });
     if spawned.is_err() {
+        PROBE_IN_FLIGHT.store(false, Ordering::Release);
         return Err("探测线程创建失败".into());
     }
-    match rx.recv_timeout(budget) {
+    let remaining = budget.saturating_sub(started.elapsed());
+    match rx.recv_timeout(remaining) {
         Ok(r) => r,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             Err(format!(

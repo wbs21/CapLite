@@ -1400,7 +1400,10 @@ mod tests {
             parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
             "版本号每一段都得是数字：{APP_VERSION}"
         );
-        // 升级版本时改这里 + Cargo.toml + app.manifest。
-        assert_eq!(WINDOW_TITLE, "CapLite v1.0.1");
+        assert_eq!(
+            WINDOW_TITLE,
+            format!("CapLite v{}", env!("CARGO_PKG_VERSION")),
+            "标题版本必须跟 Cargo.toml 同步"
+        );
     }
 }

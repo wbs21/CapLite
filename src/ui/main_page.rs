@@ -1283,7 +1283,7 @@ impl MainPage {
         i18n: &I18n,
     ) -> Option<String> {
         self.reap_finished_jobs();
-        if self.starting || self.stopping || recorder.is_some() || self.jobs_still_running() {
+        if self.has_active_recording_path(recorder.is_some()) {
             self.error = Some(i18n.t("err_recording_busy").to_string());
             return self.error.clone();
         }
@@ -1389,6 +1389,15 @@ impl MainPage {
     /// 本页是否正在做“开始/停止”的耗时工作（UI 只显示进度，不阻塞）。
     pub fn is_busy(&self) -> bool {
         self.starting || self.stopping
+    }
+
+    /// 录制子系统是否"全忙"：正在 start/stop 中 / 有活跃 Recorder / 后台 job 未 finish。
+    ///
+    /// 用于"能不能开始新录制"、"要不要拦截窗口关闭"、"要不要持续排帧"等场景。
+    /// 参数 `recorder_active` = 调用方传入的 `recorder.is_some()`（Recorder 被 &mut 限制
+    /// 无法从 `MainPage::&self` 直接访问，故由调用方显式传入）。
+    pub fn has_active_recording_path(&self, recorder_active: bool) -> bool {
+        self.starting || self.stopping || recorder_active || self.jobs_still_running()
     }
 
     fn jobs_still_running(&self) -> bool {
@@ -1573,7 +1582,7 @@ impl MainPage {
         let deadline = Instant::now() + EXIT_WATCHDOG;
         loop {
             self.poll_recording_jobs(cfg, recorder, result, i18n);
-            if !self.is_busy() && recorder.is_none() && !self.jobs_still_running() {
+            if !self.has_active_recording_path(recorder.is_some()) {
                 return !self.watchdog_fired;
             }
             if Instant::now() >= deadline {

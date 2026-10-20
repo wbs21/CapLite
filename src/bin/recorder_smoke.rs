@@ -83,6 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|n| n.to_os_string())
             .unwrap_or_else(|| "rec.mp4".into()),
     );
+    // smoke 工具是手工回归入口：重复运行前清理旧的固定流文件，避免
+    // Recorder::start 的 create_new 预占被上一次测试产物挡住。
+    let _ = std::fs::remove_file(&streaming);
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)

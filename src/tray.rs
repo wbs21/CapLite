@@ -124,6 +124,11 @@ static TRAY_ICON_PRESENT: std::sync::atomic::AtomicBool =
 static TRAY_HICON_RAW: AtomicIsize = AtomicIsize::new(0);
 /// 当前托盘 tooltip（Explorer 重启后 `NIM_ADD` 要用；录制中会带时长）。
 static TRAY_TOOLTIP: Mutex<Option<String>> = Mutex::new(None);
+/// 当前**真的注册着**的全局热键；`None` = 没注册。
+///
+/// WM_HOTKEY 的 lParam 校验靠它：跨进程 PostMessage 来的 lParam 里 low/high word
+/// 通常是垃圾值，用 `RegisterHotKey` 发过来的才会被系统填成真实的 vk + modifiers。
+static TRAY_CURRENT_HOTKEY: Mutex<Option<Hotkey>> = Mutex::new(None);
 
 /// 菜单命令 id（`TPM_RETURNCMD` 直接把选中的 id 返回来，不必走 `WM_COMMAND`）。
 const CMD_SHOW: u32 = 1;
@@ -704,8 +709,34 @@ unsafe extern "system" fn tray_wndproc(
             LRESULT(0)
         }
         WM_HOTKEY => {
+            // wParam 是热键 id；lParam 低字 = vk，高字 = MOD_* 修饰键状态
+            // （跨进程 PostMessage 伪造的 WM_HOTKEY 的 lParam 通常是垃圾值，
+            // 系统 RegisterHotKey 发过来的才会被正确填充）。
+            let l_param = lparam.0 as u32;
+            let low_vk = l_param & 0xFFFF;
+            let hi_mods = (l_param >> 16) & 0xFFFF;
+
             if wparam.0 as i32 == HOTKEY_ID {
-                push_command(TrayCommand::ToggleRecording);
+                let ok = TRAY_CURRENT_HOTKEY
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|hk| {
+                        let expected_mods = hk.modifiers.0 & !MOD_NOREPEAT.0;
+                        hk.vk == low_vk && expected_mods == hi_mods
+                    })
+                    .unwrap_or(false);
+                if ok {
+                    push_command(TrayCommand::ToggleRecording);
+                } else {
+                    tracing::debug!(
+                        "忽略 WM_HOTKEY 伪造: id={}, lParam={} (low_vk={}, hi_mods={})",
+                        wparam.0 as i32,
+                        l_param,
+                        low_vk,
+                        hi_mods
+                    );
+                }
             }
             LRESULT(0)
         }
@@ -784,6 +815,9 @@ impl HotkeyRegistrar {
         }
         self.registered = false;
         self.current = None;
+        if let Ok(mut g) = TRAY_CURRENT_HOTKEY.lock() {
+            *g = None;
+        }
     }
 
     /// 单纯地试注册一个组合（成功才认账；失败把 `GetLastError` 留下来）。
@@ -793,6 +827,9 @@ impl HotkeyRegistrar {
                 self.registered = true;
                 self.current = Some(hk);
                 self.error = None;
+                if let Ok(mut g) = TRAY_CURRENT_HOTKEY.lock() {
+                    *g = Some(hk);
+                }
                 true
             }
             Err(e) => {
@@ -801,6 +838,9 @@ impl HotkeyRegistrar {
                 let system = e.to_string();
                 self.registered = false;
                 self.current = None;
+                if let Ok(mut g) = TRAY_CURRENT_HOTKEY.lock() {
+                    *g = None;
+                }
                 self.error = Some(HotkeyRegisterError {
                     hotkey: hk,
                     code,
